@@ -2107,6 +2107,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_network_session_closes_cleanly_over_websocket() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (operator_io, client_io) = duplex(64 * 1024);
+            let operator_websocket =
+                WebSocketStream::from_raw_socket(operator_io, Role::Server, None).await;
+            let client_websocket =
+                WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let client_task = tokio::spawn(run_client_network_session(
+                client_websocket,
+                OfferedSession::Socks {},
+            ));
+            let (session, runtime) = start_operator_network_session(operator_websocket)
+                .await
+                .unwrap();
+            drop(session);
+            runtime.wait().await.unwrap();
+            client_task.await.unwrap().unwrap();
+        })
+        .await
+        .expect("network session did not shut down");
+    }
+
+    #[tokio::test]
     async fn client_udp_flow_negotiates_capsules_and_preserves_a_datagram() {
         let echo_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo_socket.local_addr().unwrap();

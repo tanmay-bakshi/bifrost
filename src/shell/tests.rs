@@ -1138,6 +1138,61 @@ async fn local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport() {
 }
 
 #[tokio::test]
+async fn local_ssh_proxy_preserves_remote_request_rejection() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let temp_dir = tempdir().unwrap();
+        let key =
+            Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
+        let (client_io, server_io) = duplex(64 * 1024);
+        let server_task = tokio::spawn(run_remote_shell_server(
+            server_io,
+            "support-user".to_string(),
+            key.public_key().clone(),
+            temp_dir.path().to_path_buf(),
+            ShellLaunch::detect_for_current_platform().unwrap(),
+        ));
+        let upstream = Arc::new(AsyncMutex::new(
+            connect_authenticated_client_transport(client_io, "support-user", Arc::clone(&key))
+                .await
+                .unwrap(),
+        ));
+        let proxy = start_ssh_proxy_listener(
+            Arc::clone(&upstream),
+            Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+            Arc::clone(&key),
+            "support-user".to_string(),
+            key.public_key().clone(),
+        )
+        .await
+        .unwrap();
+        let stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let local = connect_none_authenticated_client(stream, "support-user").await;
+        let mut channel = local.channel_open_session().await.unwrap();
+        // The remote server requires an allocated PTY before starting a shell.
+        channel.request_shell(true).await.unwrap();
+        let reply = channel.wait().await;
+        local
+            .disconnect(Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+        drop(proxy);
+        upstream
+            .lock()
+            .await
+            .disconnect(Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+        assert!(
+            matches!(reply, Some(ChannelMsg::Failure)),
+            "proxy returned {reply:?}"
+        );
+    })
+    .await
+    .expect("proxy request rejection did not complete");
+}
+
+#[tokio::test]
 async fn local_ssh_proxy_executes_noninteractive_commands() {
     let temp_dir = tempdir().unwrap();
     let allowed_private_key =
