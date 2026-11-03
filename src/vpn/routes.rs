@@ -1383,7 +1383,8 @@ fn replace_bypass_resource<E: CommandExecutor>(
         (
             Platform::Macos,
             OwnedResource::Route {
-                prefix: old_prefix, ..
+                prefix: old_prefix,
+                target: RouteTarget::MacosGateway { .. },
             },
             OwnedResource::Route {
                 prefix: new_prefix,
@@ -1406,6 +1407,11 @@ fn replace_bypass_resource<E: CommandExecutor>(
             )?;
             Ok(())
         }
+        // Darwin's RTM_CHANGE does not reliably replace interface-route ownership or RTF_GATEWAY.
+        // Leave the pinned route intact so session teardown can restore the physical network.
+        (Platform::Macos, _, _) => bail!(
+            "macOS cannot atomically replace a direct WebSocket bypass route; disconnect and reconnect on the new network"
+        ),
         (Platform::Windows, _, _) => {
             apply_resource(platform, executor, new)?;
             cleanup_resource(platform, executor, old)
@@ -2211,8 +2217,8 @@ fn parse_json_ip(value: &serde_json::Value, label: &str) -> Result<IpAddr> {
 enum PeerPath {
     Linux(LinuxPeerPath),
     Macos {
-        gateway: String,
-        interface: Option<String>,
+        gateway: Option<String>,
+        interface: String,
     },
     Windows {
         next_hop: IpAddr,
@@ -2267,12 +2273,7 @@ fn paths_share_egress(left: &PeerPath, right: &PeerPath) -> bool {
                 gateway: right_gateway,
                 interface: right_interface,
             },
-        ) => {
-            left_gateway == right_gateway
-                && (left_interface == right_interface
-                    || left_interface.is_none()
-                    || right_interface.is_none())
-        }
+        ) => left_gateway == right_gateway && left_interface == right_interface,
         (
             PeerPath::Windows {
                 next_hop: left_hop,
@@ -2306,8 +2307,13 @@ fn bypass_resource(
             nexthops: path.parent.nexthops.clone(),
             metric: ROUTE_METRIC,
         },
-        (Platform::Macos, PeerPath::Macos { gateway, .. }) => RouteTarget::MacosGateway {
-            gateway: gateway.clone(),
+        (Platform::Macos, PeerPath::Macos { gateway, interface }) => match gateway {
+            Some(gateway) => RouteTarget::MacosGateway {
+                gateway: gateway.clone(),
+            },
+            None => RouteTarget::MacosInterface {
+                interface: interface.clone(),
+            },
         },
         (
             Platform::Windows,
@@ -2332,7 +2338,7 @@ fn path_uses_tunnel(path: &PeerPath, tunnel: &TunnelIdentity) -> bool {
             .nexthops
             .iter()
             .any(|nexthop| nexthop.interface == tunnel.name),
-        PeerPath::Macos { interface, .. } => interface.as_ref() == Some(&tunnel.name),
+        PeerPath::Macos { interface, .. } => *interface == tunnel.name,
         PeerPath::Windows {
             interface_index, ..
         } => *interface_index == tunnel.index,
@@ -2348,13 +2354,7 @@ fn path_is_available<E: CommandExecutor>(
         (Platform::Linux, PeerPath::Linux(path)) => {
             linux_parent_route_is_present(executor, &path.parent)
         }
-        (
-            Platform::Macos,
-            PeerPath::Macos {
-                interface: Some(interface),
-                ..
-            },
-        ) => {
+        (Platform::Macos, PeerPath::Macos { interface, .. }) => {
             let command = CommandSpec::new("ifconfig", [interface]);
             let output = executor.execute(&command)?;
             if output.exit_code == Some(1)
@@ -2365,12 +2365,6 @@ fn path_is_available<E: CommandExecutor>(
             }
             Ok(output.require_success(&command)?.contains("status: active"))
         }
-        (
-            Platform::Macos,
-            PeerPath::Macos {
-                interface: None, ..
-            },
-        ) => Ok(false),
         (
             Platform::Windows,
             PeerPath::Windows {
@@ -2627,12 +2621,29 @@ fn lookup_default_path<E: CommandExecutor>(
 }
 
 fn parse_macos_peer_path(output: &str) -> Result<PeerPath> {
-    let gateway = macos_route_value(output, "gateway")
-        .context("`route get` output did not identify a gateway")?
+    let interface = macos_route_value(output, "interface")
+        .context("`route get` output did not identify an interface")?
         .to_string();
-    validate_macos_gateway(&gateway)?;
-    let interface = macos_route_value(output, "interface").map(ToString::to_string);
+    validate_interface_name(&interface)?;
+    // Direct and neighbor routes have no IP gateway, even when route(8) prints a link address.
+    let gateway = if macos_route_uses_gateway(output)? {
+        let gateway = macos_route_value(output, "gateway")
+            .context("gateway route did not identify its gateway")?
+            .to_string();
+        validate_macos_gateway(&gateway)?;
+        Some(gateway)
+    } else {
+        None
+    };
     Ok(PeerPath::Macos { gateway, interface })
+}
+
+fn macos_route_uses_gateway(output: &str) -> Result<bool> {
+    let flags = macos_route_value(output, "flags")
+        .and_then(|flags| flags.strip_prefix('<'))
+        .and_then(|flags| flags.strip_suffix('>'))
+        .context("`route get` output did not identify valid route flags")?;
+    Ok(flags.split(',').any(|flag| flag == "GATEWAY"))
 }
 
 fn parse_windows_peer_path(output: &str) -> Result<PeerPath> {
@@ -3045,6 +3056,9 @@ fn macos_route_matches<E: CommandExecutor>(
         return Ok(false);
     };
     if !macos_destination_matches(&output, prefix) {
+        return Ok(false);
+    }
+    if macos_route_uses_gateway(&output)? != gateway.is_some() {
         return Ok(false);
     }
     let gateway_matches =
@@ -3999,11 +4013,110 @@ mod tests {
         .unwrap()
     }
 
-    fn macos_route_fixture(prefix: IpNet, gateway: &str, interface: &str) -> String {
+    fn macos_route_fixture(prefix: IpNet, gateway: Option<&str>, interface: &str) -> String {
+        let (gateway_line, flags) = match gateway {
+            Some(gateway) => (format!("gateway: {gateway}\n"), "<UP,GATEWAY,DONE,STATIC>"),
+            None => (String::new(), "<UP,DONE,STATIC>"),
+        };
         format!(
-            "route to: {}\ndestination: {prefix}\ngateway: {gateway}\ninterface: {interface}\n",
+            "route to: {}\ndestination: {prefix}\n{gateway_line}interface: {interface}\nflags: {flags}\n",
             prefix.addr()
         )
+    }
+
+    #[test]
+    fn macos_direct_routes_keep_the_peer_on_its_interface() {
+        for output in [
+            "route to: 192.168.50.54\ndestination: 192.168.50.54\ninterface: en0\nflags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>\n",
+            "route to: 192.168.50.222\ndestination: 192.168.50.0\nmask: 255.255.255.0\ninterface: en0\nflags: <UP,DONE,CLONING,STATIC>\n",
+            "destination: 192.168.50.54\ngateway: 4a:c8:c9:44:d8:48\ninterface: en0\nflags: <UP,HOST,DONE,LLINFO>\n",
+            "destination: fe80::1%en0\ngateway: link#14\ninterface: en0\nflags: <UP,HOST,DONE,LLINFO>\n",
+        ] {
+            let path = parse_macos_peer_path(output).unwrap();
+            assert_eq!(
+                path,
+                PeerPath::Macos {
+                    gateway: None,
+                    interface: "en0".to_string()
+                }
+            );
+            let peer = "192.168.50.54".parse().unwrap();
+            assert_eq!(
+                bypass_resource(Platform::Macos, peer, &path).unwrap(),
+                Some(OwnedResource::Route {
+                    prefix: "192.168.50.54/32".parse().unwrap(),
+                    target: RouteTarget::MacosInterface {
+                        interface: "en0".to_string()
+                    },
+                })
+            );
+            let default = parse_macos_peer_path("destination: default\ngateway: 192.168.50.1\ninterface: en0\nflags: <UP,GATEWAY,DONE>\n").unwrap();
+            assert!(!paths_share_egress(&path, &default));
+        }
+    }
+
+    #[test]
+    fn macos_gateway_routes_require_both_gateway_and_interface() {
+        for output in [
+            "destination: default\ninterface: en0\nflags: <UP,GATEWAY,DONE>\n",
+            "destination: default\ngateway: 192.0.2.1\nflags: <UP,GATEWAY,DONE>\n",
+            "destination: default\ngateway: 192.0.2.1\ninterface: en0\n",
+        ] {
+            assert!(parse_macos_peer_path(output).is_err());
+        }
+        let path = parse_macos_peer_path("destination: default\ngateway: fe80::1%en0\ninterface: en0\nflags: <UP,GATEWAY,DONE>\n").unwrap();
+        assert_eq!(
+            path,
+            PeerPath::Macos {
+                gateway: Some("fe80::1%en0".to_string()),
+                interface: "en0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn macos_direct_route_cleanup_preserves_gateway_route_on_same_interface() {
+        let prefix = "203.0.113.8/32".parse().unwrap();
+        let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(
+            macos_route_fixture(prefix, Some("192.0.2.1"), "en0"),
+        ))]);
+        cleanup_route(
+            &executor,
+            prefix,
+            &RouteTarget::MacosInterface {
+                interface: "en0".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(executor.calls().len(), 1);
+    }
+
+    #[test]
+    fn macos_bypass_kind_changes_fail_before_mutating_routes() {
+        let prefix = "203.0.113.8/32".parse().unwrap();
+        let direct = OwnedResource::Route {
+            prefix,
+            target: RouteTarget::MacosInterface {
+                interface: "en0".to_string(),
+            },
+        };
+        let gateway = OwnedResource::Route {
+            prefix,
+            target: RouteTarget::MacosGateway {
+                gateway: "192.0.2.1".to_string(),
+            },
+        };
+        let executor = MockExecutor::with_outputs([]);
+        assert!(replace_bypass_resource(Platform::Macos, &executor, &gateway, &direct).is_err());
+        assert!(replace_bypass_resource(Platform::Macos, &executor, &direct, &gateway).is_err());
+        let moved = OwnedResource::Route {
+            prefix,
+            target: RouteTarget::MacosInterface {
+                interface: "en1".to_string(),
+            },
+        };
+        assert!(replace_bypass_resource(Platform::Macos, &executor, &direct, &moved).is_err());
+        assert!(executor.calls().is_empty());
     }
 
     fn journal_store(temp: &TempDir) -> JournalStore {
@@ -4310,7 +4423,7 @@ mod tests {
     fn macos_cleanup_leaves_a_foreign_interface_route_untouched() {
         let prefix = "10.20.0.0/16".parse().unwrap();
         let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(
-            macos_route_fixture(prefix, "192.0.2.1", "en0"),
+            macos_route_fixture(prefix, Some("192.0.2.1"), "en0"),
         ))]);
         let target = RouteTarget::MacosInterface {
             interface: "utun19".to_string(),
@@ -4327,7 +4440,7 @@ mod tests {
     fn macos_cleanup_leaves_a_foreign_gateway_route_untouched() {
         let prefix = "203.0.113.8/32".parse().unwrap();
         let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(
-            macos_route_fixture(prefix, "192.0.2.254", "en0"),
+            macos_route_fixture(prefix, Some("192.0.2.254"), "en0"),
         ))]);
         let target = RouteTarget::MacosGateway {
             gateway: "192.0.2.1".to_string(),
@@ -4345,7 +4458,7 @@ mod tests {
         let prefix = "fd7f:1234::/96".parse().unwrap();
         let executor = MockExecutor::with_outputs([
             Ok(CommandOutput::success(macos_route_fixture(
-                prefix, "utun19", "utun19",
+                prefix, None, "utun19",
             ))),
             Ok(CommandOutput::success("")),
         ]);
@@ -4375,7 +4488,7 @@ mod tests {
         let executor = MockExecutor::with_outputs([
             Ok(CommandOutput::success(macos_route_fixture(
                 prefix,
-                "192.0.2.1",
+                Some("192.0.2.1"),
                 "en0",
             ))),
             Ok(CommandOutput::success("")),
@@ -4397,7 +4510,7 @@ mod tests {
         let prefix = "10.20.0.0/16".parse().unwrap();
         let executor = MockExecutor::with_outputs([
             Ok(CommandOutput::success(macos_route_fixture(
-                prefix, "utun19", "utun19",
+                prefix, None, "utun19",
             ))),
             Ok(CommandOutput {
                 exit_code: Some(1),
@@ -4448,11 +4561,14 @@ mod tests {
             };
             let executor = MockExecutor::with_outputs([Ok(failure.clone())]);
             assert!(apply_route(&executor, prefix, &target, ApplyMode::Initial).is_err());
+            let gateway = match &target {
+                RouteTarget::MacosInterface { .. } => None,
+                RouteTarget::MacosGateway { gateway } => Some(gateway.as_str()),
+                _ => unreachable!("test contains only macOS route targets"),
+            };
             let executor = MockExecutor::with_outputs([
                 Ok(CommandOutput::success(macos_route_fixture(
-                    prefix,
-                    "192.0.2.1",
-                    "utun42",
+                    prefix, gateway, "utun42",
                 ))),
                 Ok(failure),
             ]);
@@ -4543,8 +4659,8 @@ mod tests {
             (
                 Platform::Macos,
                 PeerPath::Macos {
-                    gateway: "192.0.2.1".to_string(),
-                    interface: Some("en0".to_string()),
+                    gateway: Some("192.0.2.1".to_string()),
+                    interface: "en0".to_string(),
                 },
             ),
             (
@@ -4569,8 +4685,8 @@ mod tests {
     #[test]
     fn successful_egress_inspection_preserves_available_and_missing_states() {
         let macos_path = PeerPath::Macos {
-            gateway: "192.0.2.1".to_string(),
-            interface: Some("en0".to_string()),
+            gateway: Some("192.0.2.1".to_string()),
+            interface: "en0".to_string(),
         };
         for (status, expected) in [("active", true), ("inactive", false)] {
             let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(format!(
@@ -4616,13 +4732,13 @@ mod tests {
     #[test]
     fn successful_default_route_inspection_preserves_selected_egress() {
         let macos = MockExecutor::with_outputs([Ok(CommandOutput::success(
-            "route to: default\ndestination: default\ngateway: 192.0.2.1\ninterface: en0\n",
+            "route to: default\ndestination: default\ngateway: 192.0.2.1\ninterface: en0\nflags: <UP,GATEWAY,DONE,STATIC>\n",
         ))]);
         assert_eq!(
             lookup_default_path(Platform::Macos, &macos, false).unwrap(),
             Some(PeerPath::Macos {
-                gateway: "192.0.2.1".to_string(),
-                interface: Some("en0".to_string()),
+                gateway: Some("192.0.2.1".to_string()),
+                interface: "en0".to_string(),
             })
         );
         let windows = MockExecutor::with_outputs([Ok(CommandOutput::success(
@@ -5601,6 +5717,83 @@ mod tests {
         cleanup_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
         assert!(!resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
         cleanup_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires root; temporarily installs documentation-prefix host routes"]
+    fn macos_direct_bypass_lifecycle_matches_the_kernel() {
+        struct Routes(Vec<OwnedResource>);
+        impl Drop for Routes {
+            fn drop(&mut self) {
+                for resource in self.0.iter().rev() {
+                    cleanup_resource(Platform::Macos, &SystemCommandExecutor, resource)
+                        .expect("temporary host route cleanup failed");
+                }
+            }
+        }
+        let default = lookup_default_path(Platform::Macos, &SystemCommandExecutor, false)
+            .unwrap()
+            .unwrap();
+        let PeerPath::Macos {
+            gateway: Some(gateway),
+            interface,
+        } = default
+        else {
+            panic!("test requires IPv4 default gateway")
+        };
+        for prefix in ["198.51.100.237/32", "2001:db8::237/128"] {
+            let prefix: IpNet = prefix.parse().unwrap();
+            let output = run_macos_route_lookup(
+                &SystemCommandExecutor,
+                &CommandSpec::new(
+                    "route",
+                    [
+                        "-n",
+                        "get",
+                        macos_family_flag(prefix),
+                        &prefix.addr().to_string(),
+                    ],
+                ),
+            )
+            .unwrap();
+            assert!(
+                !output.is_some_and(|output| macos_destination_matches(&output, prefix)),
+                "test destination already has an exact host route"
+            );
+            let direct = OwnedResource::Route {
+                prefix,
+                target: RouteTarget::MacosInterface {
+                    interface: interface.clone(),
+                },
+            };
+            let mut routes = Routes(vec![direct.clone()]);
+            apply_resource(Platform::Macos, &SystemCommandExecutor, &direct).unwrap();
+            assert!(resource_is_present(Platform::Macos, &SystemCommandExecutor, &direct).unwrap());
+            cleanup_resource(Platform::Macos, &SystemCommandExecutor, &direct).unwrap();
+            assert!(
+                !resource_is_present(Platform::Macos, &SystemCommandExecutor, &direct).unwrap()
+            );
+            if prefix.addr().is_ipv4() {
+                let routed = OwnedResource::Route {
+                    prefix,
+                    target: RouteTarget::MacosGateway {
+                        gateway: gateway.clone(),
+                    },
+                };
+                routes.0.push(routed.clone());
+                apply_resource(Platform::Macos, &SystemCommandExecutor, &routed).unwrap();
+                cleanup_resource(Platform::Macos, &SystemCommandExecutor, &direct).unwrap();
+                assert!(
+                    resource_is_present(Platform::Macos, &SystemCommandExecutor, &routed).unwrap()
+                );
+                cleanup_resource(Platform::Macos, &SystemCommandExecutor, &routed).unwrap();
+                assert!(
+                    !resource_is_present(Platform::Macos, &SystemCommandExecutor, &routed).unwrap()
+                );
+            }
+            drop(routes);
+        }
     }
 
     fn unix_ipv6_address_resource(platform: Platform, interface: &str) -> OwnedResource {

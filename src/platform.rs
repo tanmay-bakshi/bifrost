@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub enum OperatingSystem {
     Linux,
     Macos,
+    Ios,
     Windows,
 }
 
@@ -21,6 +22,7 @@ impl OperatingSystem {
         match env::consts::OS {
             "linux" => Ok(Self::Linux),
             "macos" => Ok(Self::Macos),
+            "ios" => Ok(Self::Ios),
             "windows" => Ok(Self::Windows),
             other => bail!("unsupported client operating system `{other}`"),
         }
@@ -30,6 +32,7 @@ impl OperatingSystem {
         match self {
             Self::Linux => "Linux",
             Self::Macos => "macOS",
+            Self::Ios => "iOS",
             Self::Windows => "Windows",
         }
     }
@@ -87,6 +90,7 @@ pub struct ShellLaunch {
 impl ShellLaunch {
     pub fn detect_for_current_platform() -> Result<Self> {
         match OperatingSystem::current()? {
+            OperatingSystem::Ios => bail!("shell sessions are unavailable on iOS"),
             OperatingSystem::Windows => detect_windows_shell(
                 env::var_os("PATH").as_deref(),
                 env::var_os("ProgramFiles").as_deref(),

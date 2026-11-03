@@ -10,7 +10,7 @@ keywords = ["ssh", "socks", "vpn", "remote-support", "websocket"]
 categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
-members = [".", "crates/wintun-security"]
+members = [".", "crates/wintun-security", "crates/ios-client"]
 resolver = "2"
 
 [dependencies]

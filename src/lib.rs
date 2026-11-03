@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod client;
 mod control;
 mod debug;
 mod keys;
@@ -12,6 +13,7 @@ mod socks;
 mod vpn;
 mod websocket;
 
+pub use client::{ClientConfig, ClientEvent, ClientHandler, run_client, session_consent_prompt};
 pub use control::{
     ClientDecision, ClientHello, ClientMetadata, ControlPacket, OfferedSession, ServerOffer,
     VpnScope, recv_packet, send_packet,
@@ -45,7 +47,7 @@ pub fn install_default_rustls_crypto_provider() {
 
 pub const DEFAULT_CONNECT_PATH: &str = "/connect";
 pub const DEFAULT_HEALTH_PATH: &str = "/healthz";
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub(crate) const NETWORK_SESSION_FLOW_LIMIT: usize = 256;
 pub(crate) const MAX_NETWORK_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize - 20 - 8;
 

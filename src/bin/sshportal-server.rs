@@ -86,7 +86,7 @@ struct ServerCli {
     /// Open a system VPN through the client.
     ///
     /// With no include selectors, all internet-bound IPv4, IPv6, TCP, UDP, and DNS traffic is
-    /// routed through the client. This mode requires administrator/root privileges and WSS.
+    /// routed through the client. This mode requires administrator/root privileges. Use WSS on untrusted networks.
     #[arg(
         long,
         conflicts_with_all = [
@@ -477,7 +477,9 @@ async fn run() -> Result<()> {
                     );
                 }
             }
-            println!("VPN mode requires administrator/root privileges and WSS");
+            println!(
+                "VPN mode requires administrator/root privileges; use WSS on untrusted networks"
+            );
         }
     }
 

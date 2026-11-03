@@ -69,7 +69,7 @@ those address identities.
 
 Recovery restores access for **new connections**. Existing TCP/UDP flows and interactive SSH shells
 end with the dropped transport; they are not replayed or resumed. Both binaries must implement
-control protocol version 8.
+control protocol version 9.
 
 ## SSH Mode
 
@@ -219,7 +219,7 @@ refuses to start domain or full-tunnel DNS when it cannot allocate non-conflicti
 selective mode, unselected DNS queries continue to use the operator's normal resolvers. A
 CIDR-only policy allocates no synthetic pools and does not change DNS configuration.
 
-VPN mode requires an HTTPS/WSS URL. `sshportal-server` deliberately remains a small HTTP/WS server,
+VPN mode accepts HTTP/WS and HTTPS/WSS URLs. Use HTTPS/WSS to encrypt the portal connection. `sshportal-server` deliberately remains a small HTTP/WS server,
 so terminate TLS with a reverse proxy and forward the WebSocket to its listener over a trusted
 backend hop:
 
@@ -245,8 +245,8 @@ sshportal-client \
   --server "https://support.example?token=<printed-token>"
 ```
 
-The client refuses a VPN offer received through `http://` or `ws://`, including when
-`--approve-session` is present. WSS servers and HTTPS proxies are verified against the platform
+With HTTP/WS, portal traffic and the join token are unencrypted. Use plain WS only
+on a trusted network or inside a separately secured tunnel. WSS servers and HTTPS proxies are verified against the platform
 trust policy. On Windows and macOS, that includes locally installed enterprise roots and
 operating-system distrust decisions; copying the same executable to another machine does not carry
 a private bundled CA snapshot with it.
@@ -280,6 +280,10 @@ the WebSocket's immediate socket peer to its original physical path; broader sel
 safe because that host route is more specific, but an exact `/32` or `/128` selector for the peer
 is rejected. Existing directly attached networks and loopback remain local unless a more-specific
 selected route deliberately covers them.
+
+On macOS, directly attached peers use interface routes. A network change that requires
+replacing a direct bypass ends the session and restores the network; reconnect to establish
+a path on the new network.
 
 This is intentionally a TCP/UDP application tunnel rather than a general IP router. Its important
 boundaries are:
@@ -458,9 +462,69 @@ also contains the signed Wintun DLL and [`WINTUN-LICENSE.txt`](licenses/WINTUN.t
 has a SHA-256 checksum file.
 
 On macOS, build the standalone binaries with `cargo build --locked --release --bins`.
+Run `target/release/sshportal-server` and `target/release/sshportal-client` from that
+build. Cargo writes to `target/release`; it does not update extracted archives in `dist`.
 SSH, SOCKS, and system VPN modes do not require an Apple Developer membership or provisioning
 profiles. System VPN mode requires root privileges to configure networking.
 
 ## License
 
 `sshportal` is licensed under Apache 2.0. See [`LICENSE`](LICENSE). The separately distributed Wintun binary is governed by its bundled license.
+
+## iOS Client
+
+The native iPhone and iPad app in `ios/SSHPortal.xcodeproj` provides VPN and SOCKS
+**egress**: an approved operator uses this device's network connection. It does not
+install a VPN on the phone, host a portal server, or provide SSH shell access.
+The app and desktop server use control protocol version 9; build both from this
+source tree.
+
+Open the project in Xcode, select the `SSHPortal` scheme, choose your signing team
+under Signing & Capabilities, and run it on your device. The app targets iOS 17 or
+later. Install Rust and the matching targets first:
+
+```bash
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+open ios/SSHPortal.xcodeproj
+```
+
+An Intel simulator additionally requires `x86_64-apple-ios`. Xcode's build phase
+compiles the Rust library and links it into the app. No Network Extension
+entitlement or background mode is needed. For an unsigned device build:
+
+```bash
+xcodebuild -project ios/SSHPortal.xcodeproj -scheme SSHPortal \
+  -configuration Release -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+Paste the server's complete HTTP/WS or HTTPS/WSS join URL, including its token, then tap
+Connect. The app shows the operator, requested capability, and any VPN address or
+domain restrictions before asking for approval. Both network modes support plain and encrypted connections. The approval prompt
+identifies unencrypted connections. For HTTPS/WSS, certificate validation uses the device's trust settings; private CAs
+must be installed and trusted there. Allow local-network access if iOS asks and
+the portal or requested destinations are on your LAN.
+
+Keep the app in the foreground for the duration of the session. Switching apps or
+locking the device disconnects, cancels retries, and discards consent and resume
+credentials. Returning to the app does not resume the session. The screen can be
+kept awake during a session with the in-app toggle. Automatic reconnection, when
+enabled on both peers, applies only while the app remains in the foreground.
+Existing TCP and UDP flows still end when their transport is lost.
+
+The app uses the same Rust negotiation, consent retention, reconnect deadlines,
+TLS verification, resolver, policy enforcement, and TCP/UDP session code as the
+terminal client. Swift owns presentation and foreground lifecycle; the native
+boundary in `crates/ios-client` owns one cancellable session per app connection.
+Join URLs and tokens are not saved by the app.
+
+Run the simulator UI checks with:
+
+```bash
+xcodebuild test -project ios/SSHPortal.xcodeproj -scheme SSHPortal \
+  -destination 'platform=iOS Simulator,name=iPhone 17'
+```
+
+The live connection test also accepts `TEST_RUNNER_SSHPORTAL_TEST_SERVER_URL`
+when running `xcodebuild test`. Point it at an HTTP/WS portal, or an HTTPS/WSS portal with a certificate trusted
+by that simulator. It checks explicit consent and disconnect-on-background.

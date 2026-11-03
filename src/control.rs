@@ -246,8 +246,16 @@ where
 }
 
 fn control_packet_decode_error(error: serde_json::Error) -> anyhow::Error {
+    let detail = match error.classify() {
+        serde_json::error::Category::Data => {
+            "schema mismatch; ensure both peers use matching builds"
+        }
+        serde_json::error::Category::Syntax => "invalid JSON syntax",
+        serde_json::error::Category::Eof => "incomplete JSON",
+        serde_json::error::Category::Io => "JSON input could not be read",
+    };
     anyhow!(
-        "failed to decode control packet at line {} column {}",
+        "failed to decode control packet at line {} column {} ({detail})",
         error.line(),
         error.column()
     )
@@ -654,6 +662,7 @@ mod tests {
         let displayed = format!("{error:#}");
 
         assert!(displayed.contains("failed to decode control packet at line 1 column"));
+        assert!(displayed.contains("schema mismatch; ensure both peers use matching builds"));
         assert!(!displayed.contains(attacker_value));
     }
 
