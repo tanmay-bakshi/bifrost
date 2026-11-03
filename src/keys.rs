@@ -9,13 +9,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use russh::keys::{self, PrivateKey, PublicKey, ssh_key};
 
 #[derive(Clone)]
-pub struct OperatorKeyMaterial {
+pub struct ConsumerKeyMaterial {
     private_key: Arc<PrivateKey>,
     public_key_openssh: String,
     persistent: bool,
 }
 
-impl OperatorKeyMaterial {
+impl ConsumerKeyMaterial {
     pub fn from_private_key(private_key: PrivateKey, persistent: bool) -> Result<Self> {
         let public_key_openssh = private_key
             .public_key()
@@ -41,12 +41,12 @@ impl OperatorKeyMaterial {
     }
 }
 
-pub fn load_operator_key(
+pub fn load_consumer_key(
     private_key_path: Option<&Path>,
     persistent: bool,
-) -> Result<OperatorKeyMaterial> {
+) -> Result<ConsumerKeyMaterial> {
     if persistent && private_key_path.is_none() {
-        bail!("--persist-operator-key requires --operator-key");
+        bail!("--persist-consumer-key requires --consumer-key");
     }
 
     let private_key: PrivateKey = if let Some(path) = private_key_path {
@@ -56,7 +56,7 @@ pub fn load_operator_key(
         PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
             .context("failed to generate an ephemeral SSH key")?
     };
-    OperatorKeyMaterial::from_private_key(private_key, persistent)
+    ConsumerKeyMaterial::from_private_key(private_key, persistent)
 }
 
 pub fn parse_public_key(public_key_openssh: &str) -> Result<PublicKey> {
@@ -98,7 +98,7 @@ pub fn authorized_key_support() -> Result<AuthorizedKeySupport> {
     #[cfg(windows)]
     {
         Ok(AuthorizedKeySupport::Unsupported {
-            reason: "persistent operator key installation is not supported on Windows clients"
+            reason: "persistent consumer key installation is not supported on Windows clients"
                 .to_string(),
         })
     }

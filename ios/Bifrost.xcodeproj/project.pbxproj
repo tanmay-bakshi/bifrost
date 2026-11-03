@@ -9,10 +9,10 @@
 /* Begin PBXBuildFile section */
 		291385495E4C35061C2937A6 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FFAD5818811F571B8C365AA9 /* Foundation.framework */; };
 		6CF26C9AAE2CB09F86689258 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82F4609D11CD45A7FC030D1B /* ContentView.swift */; };
-		852341FC5DB8BBAD0BBC2269 /* SSHPortalApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9B78C62B1315BBFF92AC92E /* SSHPortalApp.swift */; };
+		852341FC5DB8BBAD0BBC2269 /* BifrostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9B78C62B1315BBFF92AC92E /* BifrostApp.swift */; };
 		A9BAC4A3CE3F1C3146D1132D /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FFAD5818811F571B8C365AA9 /* Foundation.framework */; };
 		D04ACE60B1F6173E70732D08 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 9DF3C1D0AFC65F9A7CCF48CE /* Assets.xcassets */; };
-		D566009D733BD2AC56CC75DE /* SSHPortalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B93772D23ECD4E4E7F5A206D /* SSHPortalTests.swift */; };
+		D566009D733BD2AC56CC75DE /* BifrostTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B93772D23ECD4E4E7F5A206D /* BifrostTests.swift */; };
 		F03C24296A36C521FB1EFD47 /* SessionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7DFD564E245FBF5B411A1FB /* SessionModel.swift */; };
 /* End PBXBuildFile section */
 
@@ -22,19 +22,19 @@
 			containerPortal = E49453F9B32465F64D7CEE27 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = A0BFE019A32A054FCF70B9CB;
-			remoteInfo = SSHPortal;
+			remoteInfo = Bifrost;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		82F4609D11CD45A7FC030D1B /* ContentView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		9A93B13728323EC862A67F23 /* SSHPortalTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SSHPortalTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		9A93B13728323EC862A67F23 /* BifrostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BifrostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		9DF3C1D0AFC65F9A7CCF48CE /* Assets.xcassets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B7DFD564E245FBF5B411A1FB /* SessionModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SessionModel.swift; sourceTree = "<group>"; };
-		B93772D23ECD4E4E7F5A206D /* SSHPortalTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SSHPortalTests.swift; sourceTree = "<group>"; };
-		BECACC7DD4BC98E1A15C5F55 /* SSHPortal-Bridging-Header.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = "SSHPortal-Bridging-Header.h"; sourceTree = "<group>"; };
-		C9B78C62B1315BBFF92AC92E /* SSHPortalApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SSHPortalApp.swift; sourceTree = "<group>"; };
-		E506FBB0EE87C0C91A2842AA /* SSHPortal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SSHPortal.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B93772D23ECD4E4E7F5A206D /* BifrostTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BifrostTests.swift; sourceTree = "<group>"; };
+		BECACC7DD4BC98E1A15C5F55 /* Bifrost-Bridging-Header.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = "Bifrost-Bridging-Header.h"; sourceTree = "<group>"; };
+		C9B78C62B1315BBFF92AC92E /* BifrostApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BifrostApp.swift; sourceTree = "<group>"; };
+		E506FBB0EE87C0C91A2842AA /* Bifrost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Bifrost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		FFAD5818811F571B8C365AA9 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 /* End PBXFileReference section */
 
@@ -66,35 +66,35 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		19848BA1357D45BF023628C0 /* SSHPortalTests */ = {
+		19848BA1357D45BF023628C0 /* BifrostTests */ = {
 			isa = PBXGroup;
 			children = (
-				B93772D23ECD4E4E7F5A206D /* SSHPortalTests.swift */,
+				B93772D23ECD4E4E7F5A206D /* BifrostTests.swift */,
 			);
-			name = SSHPortalTests;
-			path = SSHPortalTests;
+			name = BifrostTests;
+			path = BifrostTests;
 			sourceTree = "<group>";
 		};
 		344D8F671A757E11B81F048A /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				E506FBB0EE87C0C91A2842AA /* SSHPortal.app */,
-				9A93B13728323EC862A67F23 /* SSHPortalTests.xctest */,
+				E506FBB0EE87C0C91A2842AA /* Bifrost.app */,
+				9A93B13728323EC862A67F23 /* BifrostTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		761D50AADC281A5CBF81A093 /* SSHPortal */ = {
+		761D50AADC281A5CBF81A093 /* Bifrost */ = {
 			isa = PBXGroup;
 			children = (
 				82F4609D11CD45A7FC030D1B /* ContentView.swift */,
-				C9B78C62B1315BBFF92AC92E /* SSHPortalApp.swift */,
+				C9B78C62B1315BBFF92AC92E /* BifrostApp.swift */,
 				B7DFD564E245FBF5B411A1FB /* SessionModel.swift */,
-				BECACC7DD4BC98E1A15C5F55 /* SSHPortal-Bridging-Header.h */,
+				BECACC7DD4BC98E1A15C5F55 /* Bifrost-Bridging-Header.h */,
 				9DF3C1D0AFC65F9A7CCF48CE /* Assets.xcassets */,
 			);
-			name = SSHPortal;
-			path = SSHPortal;
+			name = Bifrost;
+			path = Bifrost;
 			sourceTree = "<group>";
 		};
 		7F8A9F4B9F940879680636F1 /* iOS */ = {
@@ -110,17 +110,17 @@
 			children = (
 				344D8F671A757E11B81F048A /* Products */,
 				02B98345C7E41CB296CB224F /* Frameworks */,
-				761D50AADC281A5CBF81A093 /* SSHPortal */,
-				19848BA1357D45BF023628C0 /* SSHPortalTests */,
+				761D50AADC281A5CBF81A093 /* Bifrost */,
+				19848BA1357D45BF023628C0 /* BifrostTests */,
 			);
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		870A1089EF64784CF65FA4FB /* SSHPortalTests */ = {
+		870A1089EF64784CF65FA4FB /* BifrostTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 945B9DB6915DF57C50091266 /* Build configuration list for PBXNativeTarget "SSHPortalTests" */;
+			buildConfigurationList = 945B9DB6915DF57C50091266 /* Build configuration list for PBXNativeTarget "BifrostTests" */;
 			buildPhases = (
 				64DEADABBF1191B5D710143B /* Sources */,
 				B589CE860C3A99E0A5067FF5 /* Frameworks */,
@@ -131,16 +131,16 @@
 			dependencies = (
 				B94B90A67B171BC774FC810E /* PBXTargetDependency */,
 			);
-			name = SSHPortalTests;
-			productName = SSHPortalTests;
-			productReference = 9A93B13728323EC862A67F23 /* SSHPortalTests.xctest */;
+			name = BifrostTests;
+			productName = BifrostTests;
+			productReference = 9A93B13728323EC862A67F23 /* BifrostTests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
-		A0BFE019A32A054FCF70B9CB /* SSHPortal */ = {
+		A0BFE019A32A054FCF70B9CB /* Bifrost */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 59536BD953408D4F97F4D559 /* Build configuration list for PBXNativeTarget "SSHPortal" */;
+			buildConfigurationList = 59536BD953408D4F97F4D559 /* Build configuration list for PBXNativeTarget "Bifrost" */;
 			buildPhases = (
-				3DB499CA8565B0F0FE4DFCC3 /* Build Rust Client */,
+				3DB499CA8565B0F0FE4DFCC3 /* Build Rust Core */,
 				B977CF8F10392A4F552F1725 /* Sources */,
 				4DF90D7F6D0F68341FD9A83E /* Frameworks */,
 				21A0C6F15FAA92DEB463FB60 /* Resources */,
@@ -149,9 +149,9 @@
 			);
 			dependencies = (
 			);
-			name = SSHPortal;
-			productName = SSHPortal;
-			productReference = E506FBB0EE87C0C91A2842AA /* SSHPortal.app */;
+			name = Bifrost;
+			productName = Bifrost;
+			productReference = E506FBB0EE87C0C91A2842AA /* Bifrost.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -163,7 +163,7 @@
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 1600;
 			};
-			buildConfigurationList = D5814441E6299873E8F4E155 /* Build configuration list for PBXProject "SSHPortal" */;
+			buildConfigurationList = D5814441E6299873E8F4E155 /* Build configuration list for PBXProject "Bifrost" */;
 			compatibilityVersion = "Xcode 3.2";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -178,8 +178,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A0BFE019A32A054FCF70B9CB /* SSHPortal */,
-				870A1089EF64784CF65FA4FB /* SSHPortalTests */,
+				A0BFE019A32A054FCF70B9CB /* Bifrost */,
+				870A1089EF64784CF65FA4FB /* BifrostTests */,
 			);
 		};
 /* End PBXProject section */
@@ -203,7 +203,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		3DB499CA8565B0F0FE4DFCC3 /* Build Rust Client */ = {
+		3DB499CA8565B0F0FE4DFCC3 /* Build Rust Core */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -213,7 +213,7 @@
 			);
 			inputPaths = (
 			);
-			name = "Build Rust Client";
+			name = "Build Rust Core";
 			outputFileListPaths = (
 			);
 			outputPaths = (
@@ -229,7 +229,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D566009D733BD2AC56CC75DE /* SSHPortalTests.swift in Sources */,
+				D566009D733BD2AC56CC75DE /* BifrostTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -238,7 +238,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6CF26C9AAE2CB09F86689258 /* ContentView.swift in Sources */,
-				852341FC5DB8BBAD0BBC2269 /* SSHPortalApp.swift in Sources */,
+				852341FC5DB8BBAD0BBC2269 /* BifrostApp.swift in Sources */,
 				F03C24296A36C521FB1EFD47 /* SessionModel.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -248,8 +248,8 @@
 /* Begin PBXTargetDependency section */
 		B94B90A67B171BC774FC810E /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			name = SSHPortal;
-			target = A0BFE019A32A054FCF70B9CB /* SSHPortal */;
+			name = Bifrost;
+			target = A0BFE019A32A054FCF70B9CB /* Bifrost */;
 			targetProxy = 377E289A528160464CAC5FDA /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -262,11 +262,11 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.sshportal.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.bifrost.tests;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = SSHPortal;
+				TEST_TARGET_NAME = Bifrost;
 				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
@@ -283,9 +283,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(SRCROOT)/../crates/ios-client/include",
+					"$(SRCROOT)/../crates/ios/include",
 				);
-				INFOPLIST_KEY_CFBundleDisplayName = SSHPortal;
+				INFOPLIST_KEY_CFBundleDisplayName = Bifrost;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Connect to your portal and provide approved network access to hosts on your local network.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -298,20 +298,20 @@
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/rust",
 				);
-				MARKETING_VERSION = 0.5.0;
+				MARKETING_VERSION = 0.6.0;
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
-					"-lsshportal_ios",
+					"-lbifrost_ios",
 					"-framework",
 					Security,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.sshportal;
-				PRODUCT_NAME = SSHPortal;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.bifrost;
+				PRODUCT_NAME = Bifrost;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SWIFT_OBJC_BRIDGING_HEADER = "SSHPortal/SSHPortal-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "Bifrost/Bifrost-Bridging-Header.h";
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -383,9 +383,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(SRCROOT)/../crates/ios-client/include",
+					"$(SRCROOT)/../crates/ios/include",
 				);
-				INFOPLIST_KEY_CFBundleDisplayName = SSHPortal;
+				INFOPLIST_KEY_CFBundleDisplayName = Bifrost;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Connect to your portal and provide approved network access to hosts on your local network.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -398,20 +398,20 @@
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/rust",
 				);
-				MARKETING_VERSION = 0.5.0;
+				MARKETING_VERSION = 0.6.0;
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
-					"-lsshportal_ios",
+					"-lbifrost_ios",
 					"-framework",
 					Security,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.sshportal;
-				PRODUCT_NAME = SSHPortal;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.bifrost;
+				PRODUCT_NAME = Bifrost;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SWIFT_OBJC_BRIDGING_HEADER = "SSHPortal/SSHPortal-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "Bifrost/Bifrost-Bridging-Header.h";
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALIDATE_PRODUCT = YES;
@@ -486,18 +486,18 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.sshportal.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tanmay.bifrost.tests;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = SSHPortal;
+				TEST_TARGET_NAME = Bifrost;
 			};
 			name = Debug;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		59536BD953408D4F97F4D559 /* Build configuration list for PBXNativeTarget "SSHPortal" */ = {
+		59536BD953408D4F97F4D559 /* Build configuration list for PBXNativeTarget "Bifrost" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				8028FB7896719602536ABB8C /* Release */,
@@ -506,7 +506,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		945B9DB6915DF57C50091266 /* Build configuration list for PBXNativeTarget "SSHPortalTests" */ = {
+		945B9DB6915DF57C50091266 /* Build configuration list for PBXNativeTarget "BifrostTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				11E2A8D6CB637FF6D0E64DDA /* Release */,
@@ -515,7 +515,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		D5814441E6299873E8F4E155 /* Build configuration list for PBXProject "SSHPortal" */ = {
+		D5814441E6299873E8F4E155 /* Build configuration list for PBXProject "Bifrost" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				81A3A977E34CAE61B69F8912 /* Debug */,

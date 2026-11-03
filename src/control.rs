@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
+use crate::NetworkPolicy;
 use crate::PROTOCOL_VERSION;
 use crate::platform::Platform;
-use crate::reconnect::{ReconnectHello, ReconnectOffer};
-use crate::vpn::SystemVpnPolicy;
+use crate::reconnect::ReconnectHello;
 
 const MAX_DISPLAY_LABEL_BYTES: usize = 256;
 const MAX_DECISION_NOTE_BYTES: usize = 2 * 1024;
@@ -17,52 +17,56 @@ const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClientMetadata {
+pub struct PeerMetadata {
     pub hostname: String,
     pub username: String,
     pub working_directory: String,
     pub platform: Platform,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRole {
+    Provider,
+    Consumer,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClientHello {
+pub struct PeerHello {
+    pub network_policy: Option<NetworkPolicy>,
+    pub role: PeerRole,
+    pub node_id: String,
+    pub route: Vec<String>,
     pub protocol_version: u32,
     pub reconnect: Option<ReconnectHello>,
-    pub metadata: ClientMetadata,
+    pub metadata: PeerMetadata,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServerOffer {
+pub struct AccessRequest {
     pub protocol_version: u32,
-    pub reconnect: Option<ReconnectOffer>,
-    pub operator_name: String,
-    pub session: OfferedSession,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OfferedSession {
-    Ssh {
-        ssh_public_key: String,
-        persist_key_requested: bool,
-    },
-    Socks {},
-    Vpn {
-        scope: VpnScope,
-    },
+    pub forwarding: bool,
+    pub consumer_name: String,
+    pub capability: Capability,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VpnScope {
-    System { policy: SystemVpnPolicy },
+pub enum Capability {
+    Ssh {
+        ssh_public_key: String,
+        persist_key_requested: bool,
+    },
+    Network {
+        policy: NetworkPolicy,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClientDecision {
+pub struct AccessDecision {
     pub session_allowed: bool,
     pub key_installed: bool,
     pub note: Option<String>,
@@ -71,9 +75,9 @@ pub struct ClientDecision {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlPacket {
-    ClientHello(ClientHello),
-    ServerOffer(ServerOffer),
-    ClientDecision(ClientDecision),
+    PeerHello(Box<PeerHello>),
+    AccessRequest(AccessRequest),
+    AccessDecision(AccessDecision),
     SessionReady {},
     SessionRejected { reason: String },
 }
@@ -81,9 +85,9 @@ pub enum ControlPacket {
 impl fmt::Debug for ControlPacket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ClientHello(_) => "ClientHello",
-            Self::ServerOffer(_) => "ServerOffer",
-            Self::ClientDecision(_) => "ClientDecision",
+            Self::PeerHello(_) => "PeerHello",
+            Self::AccessRequest(_) => "AccessRequest",
+            Self::AccessDecision(_) => "AccessDecision",
             Self::SessionReady {} => "SessionReady",
             Self::SessionRejected { .. } => "SessionRejected",
         })
@@ -100,33 +104,42 @@ impl ControlPacket {
                 MAX_DECISION_NOTE_BYTES,
                 true,
             ),
-            Self::ClientHello(hello) => {
+            Self::PeerHello(hello) => {
                 validate_protocol_version(hello.protocol_version)?;
+                validate_route(hello)?;
+                if hello.role == PeerRole::Consumer && hello.network_policy.is_some() {
+                    bail!("consumer cannot advertise provider availability");
+                }
                 if let Some(reconnect) = &hello.reconnect {
                     reconnect.settings.validate()?;
                 }
                 validate_terminal_text(
-                    "client username",
+                    "peer username",
                     &hello.metadata.username,
                     MAX_DISPLAY_LABEL_BYTES,
                     true,
                 )
             }
-            Self::ServerOffer(offer) => {
+            Self::AccessRequest(offer) => {
                 validate_protocol_version(offer.protocol_version)?;
-                if let Some(reconnect) = &offer.reconnect {
-                    reconnect.settings.validate()?;
+                if let Capability::Network { policy } = &offer.capability
+                    && policy.is_empty()
+                {
+                    bail!("requested network scope is empty");
+                }
+                if offer.forwarding && matches!(offer.capability, Capability::Ssh { .. }) {
+                    bail!("SSH capability cannot grant network forwarding");
                 }
                 validate_terminal_text(
-                    "server offer operator name",
-                    &offer.operator_name,
+                    "access request consumer name",
+                    &offer.consumer_name,
                     MAX_DISPLAY_LABEL_BYTES,
                     true,
                 )
             }
-            Self::ClientDecision(decision) => {
+            Self::AccessDecision(decision) => {
                 if decision.key_installed && !decision.session_allowed {
-                    bail!("a denied client decision cannot report an installed operator key");
+                    bail!("denied access cannot report an installed consumer key");
                 }
                 if let Some(note) = &decision.note {
                     validate_terminal_text(
@@ -139,6 +152,29 @@ impl ControlPacket {
                 Ok(())
             }
         }
+    }
+}
+
+fn validate_route(hello: &PeerHello) -> Result<()> {
+    let valid_id = |id: &str| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !valid_id(&hello.node_id)
+        || hello.route.len() > 16
+        || hello.route.iter().any(|id| !valid_id(id))
+    {
+        bail!("invalid peer route");
+    }
+    let mut seen = std::collections::HashSet::new();
+    if hello.route.iter().any(|id| !seen.insert(id)) {
+        bail!("peer route contains a loop");
+    }
+    match hello.role {
+        PeerRole::Provider if hello.route.first() != Some(&hello.node_id) => {
+            bail!("provider route does not begin at the peer")
+        }
+        PeerRole::Consumer if !hello.route.is_empty() => {
+            bail!("consumer must not advertise a provider route")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -271,12 +307,12 @@ fn validate_protocol_version(version: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientDecision, ClientHello, ClientMetadata, ControlPacket, MAX_DECISION_NOTE_BYTES,
-        MAX_DISPLAY_LABEL_BYTES, OfferedSession, ServerOffer, VpnScope, recv_packet, send_packet,
+        AccessDecision, AccessRequest, Capability, ControlPacket, MAX_DECISION_NOTE_BYTES,
+        MAX_DISPLAY_LABEL_BYTES, PeerHello, PeerMetadata, recv_packet, send_packet,
     };
+    use crate::NetworkPolicy;
     use crate::PROTOCOL_VERSION;
     use crate::platform::Platform;
-    use crate::vpn::SystemVpnPolicy;
     use futures_util::SinkExt;
     use tokio::io::{DuplexStream, duplex};
     use tokio_tungstenite::WebSocketStream;
@@ -301,62 +337,40 @@ mod tests {
         receive_result.unwrap()
     }
 
-    fn system_vpn_offer(operator_name: &str) -> ControlPacket {
-        ControlPacket::ServerOffer(ServerOffer {
+    fn network_request(consumer_name: &str) -> ControlPacket {
+        ControlPacket::AccessRequest(AccessRequest {
             protocol_version: PROTOCOL_VERSION,
-            reconnect: None,
-            operator_name: operator_name.to_string(),
-            session: OfferedSession::Vpn {
-                scope: VpnScope::System {
-                    policy: SystemVpnPolicy::default(),
-                },
+            forwarding: false,
+            consumer_name: consumer_name.to_string(),
+            capability: Capability::Network {
+                policy: NetworkPolicy::default(),
             },
         })
     }
 
     #[test]
-    fn system_vpn_offer_identifies_its_scope() {
-        let packet = ControlPacket::ServerOffer(ServerOffer {
+    fn network_request_carries_its_policy() {
+        let packet = ControlPacket::AccessRequest(AccessRequest {
             protocol_version: PROTOCOL_VERSION,
-            reconnect: None,
-            operator_name: "support".to_string(),
-            session: OfferedSession::Vpn {
-                scope: VpnScope::System {
-                    policy: SystemVpnPolicy::default(),
-                },
+            forwarding: false,
+            consumer_name: "support".to_string(),
+            capability: Capability::Network {
+                policy: NetworkPolicy::default(),
             },
         });
 
         let encoded = serde_json::to_value(packet).unwrap();
 
-        assert_eq!(encoded["type"], "server_offer");
-        assert_eq!(encoded["session"]["mode"], "vpn");
-        assert_eq!(encoded["session"]["scope"]["kind"], "system");
-        assert_eq!(
-            encoded["session"]["scope"]["policy"]["include_cidrs"],
-            serde_json::json!([])
-        );
-        assert_eq!(
-            encoded["session"]["scope"]["policy"]["include_domains"],
-            serde_json::json!([])
-        );
+        assert_eq!(encoded["type"], "access_request");
+        assert_eq!(encoded["capability"]["kind"], "network");
+        assert_eq!(encoded["capability"]["policy"]["kind"], "unrestricted");
     }
 
     #[test]
-    fn unsupported_vpn_scopes_are_rejected() {
-        for scope in [
-            serde_json::json!({ "kind": "application", "application": "Firefox" }),
-            serde_json::json!({ "kind": "unknown" }),
-        ] {
-            let encoded = serde_json::json!({
-                "type": "server_offer",
-                "protocol_version": PROTOCOL_VERSION,
-                "operator_name": "support",
-                "session": {
-                    "mode": "vpn",
-                    "scope": scope,
-                },
-            });
+    fn unsupported_capabilities_are_rejected() {
+        for kind in ["application", "unknown"] {
+            let mut encoded = serde_json::to_value(network_request("consumer")).unwrap();
+            encoded["capability"] = serde_json::json!({"kind": kind});
             let error = serde_json::from_value::<ControlPacket>(encoded).unwrap_err();
             assert!(error.to_string().contains("unknown variant"));
         }
@@ -364,30 +378,34 @@ mod tests {
 
     #[tokio::test]
     async fn legitimate_unicode_display_text_round_trips() {
-        let hello = ControlPacket::ClientHello(ClientHello {
+        let hello = ControlPacket::PeerHello(Box::new(PeerHello {
+            network_policy: None,
+            role: super::PeerRole::Provider,
+            node_id: "11111111111111111111111111111111".to_string(),
+            route: vec!["11111111111111111111111111111111".to_string()],
             protocol_version: PROTOCOL_VERSION,
             reconnect: None,
-            metadata: ClientMetadata {
+            metadata: PeerMetadata {
                 hostname: "workstation".to_string(),
                 username: "工程師".to_string(),
                 working_directory: "/workspace".to_string(),
                 platform: Platform::current().unwrap(),
             },
-        });
+        }));
         let received_hello = round_trip(&hello).await;
         assert_eq!(
             serde_json::to_value(received_hello).unwrap(),
             serde_json::to_value(hello).unwrap()
         );
 
-        let offer = system_vpn_offer("فريق الدعم 火狐");
+        let offer = network_request("فريق الدعم 火狐");
         let received_offer = round_trip(&offer).await;
         assert_eq!(
             serde_json::to_value(received_offer).unwrap(),
             serde_json::to_value(offer).unwrap()
         );
 
-        let decision = ControlPacket::ClientDecision(ClientDecision {
+        let decision = ControlPacket::AccessDecision(AccessDecision {
             session_allowed: false,
             key_installed: false,
             note: Some("用户已拒绝该会话。".to_string()),
@@ -401,29 +419,29 @@ mod tests {
 
     #[test]
     fn display_labels_must_be_nonblank_and_bounded() {
-        let blank_operator = system_vpn_offer("\u{2003}\u{2003}");
+        let blank_consumer = network_request("\u{2003}\u{2003}");
         assert!(
-            blank_operator
+            blank_consumer
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("operator name must not be blank")
+                .contains("consumer name must not be blank")
         );
 
         let long_operator = "a".repeat(MAX_DISPLAY_LABEL_BYTES + 1);
-        assert!(system_vpn_offer(&long_operator).validate().is_err());
+        assert!(network_request(&long_operator).validate().is_err());
 
         let long_unicode_operator = "火".repeat(MAX_DISPLAY_LABEL_BYTES / 3 + 1);
-        assert!(system_vpn_offer(&long_unicode_operator).validate().is_err());
+        assert!(network_request(&long_unicode_operator).validate().is_err());
     }
 
     #[test]
     fn terminal_controls_and_bidirectional_formatting_are_rejected() {
         for unsafe_character in ['\n', '\u{1b}', '\u{2028}', '\u{202e}', '\u{2066}'] {
             let operator = format!("support{unsafe_character}spoof");
-            assert!(system_vpn_offer(&operator).validate().is_err());
+            assert!(network_request(&operator).validate().is_err());
 
-            let decision = ControlPacket::ClientDecision(ClientDecision {
+            let decision = ControlPacket::AccessDecision(AccessDecision {
                 session_allowed: false,
                 key_installed: false,
                 note: Some(format!("declined{unsafe_character}spoof")),
@@ -434,14 +452,14 @@ mod tests {
 
     #[test]
     fn present_decision_notes_must_be_nonblank_and_bounded() {
-        let blank = ControlPacket::ClientDecision(ClientDecision {
+        let blank = ControlPacket::AccessDecision(AccessDecision {
             session_allowed: false,
             key_installed: false,
             note: Some("  ".to_string()),
         });
         assert!(blank.validate().is_err());
 
-        let long = ControlPacket::ClientDecision(ClientDecision {
+        let long = ControlPacket::AccessDecision(AccessDecision {
             session_allowed: false,
             key_installed: false,
             note: Some("n".repeat(MAX_DECISION_NOTE_BYTES + 1)),
@@ -451,7 +469,7 @@ mod tests {
 
     #[test]
     fn denied_decisions_cannot_report_an_installed_key() {
-        let decision = ControlPacket::ClientDecision(ClientDecision {
+        let decision = ControlPacket::AccessDecision(AccessDecision {
             session_allowed: false,
             key_installed: true,
             note: Some("local user declined the support session".to_string()),
@@ -462,27 +480,33 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("denied client decision cannot report an installed operator key")
+                .contains("denied access cannot report an installed consumer key")
         );
     }
 
     #[test]
     fn hello_and_offer_versions_are_validated_at_the_packet_boundary() {
-        let hello = ControlPacket::ClientHello(ClientHello {
+        let hello = ControlPacket::PeerHello(Box::new(PeerHello {
+            network_policy: None,
+            role: super::PeerRole::Provider,
+            node_id: "11111111111111111111111111111111".to_string(),
+            route: vec!["11111111111111111111111111111111".to_string()],
             protocol_version: PROTOCOL_VERSION + 1,
             reconnect: None,
-            metadata: ClientMetadata {
+            metadata: PeerMetadata {
                 hostname: "workstation".to_string(),
                 username: "engineer".to_string(),
                 working_directory: "/workspace".to_string(),
                 platform: Platform::current().unwrap(),
             },
-        });
-        let offer = ControlPacket::ServerOffer(ServerOffer {
+        }));
+        let offer = ControlPacket::AccessRequest(AccessRequest {
             protocol_version: PROTOCOL_VERSION + 1,
-            reconnect: None,
-            operator_name: "support".to_string(),
-            session: OfferedSession::Socks {},
+            forwarding: false,
+            consumer_name: "support".to_string(),
+            capability: Capability::Network {
+                policy: crate::NetworkPolicy::unrestricted(),
+            },
         });
 
         for packet in [hello, offer] {
@@ -498,126 +522,91 @@ mod tests {
 
     #[test]
     fn every_control_packet_layer_rejects_unknown_fields() {
-        let cases = [
+        let hello = ControlPacket::PeerHello(Box::new(PeerHello {
+            network_policy: None,
+            role: super::PeerRole::Provider,
+            node_id: "11111111111111111111111111111111".to_string(),
+            route: vec!["11111111111111111111111111111111".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            metadata: PeerMetadata {
+                hostname: "host".to_string(),
+                username: "user".to_string(),
+                working_directory: "/".to_string(),
+                platform: Platform::current().unwrap(),
+            },
+            reconnect: Some(crate::ReconnectHello {
+                identity: crate::ReconnectSecret::generate(),
+                peer_identity: None,
+                settings: crate::ReconnectSettings {
+                    interval_seconds: 1,
+                    timeout_seconds: 5,
+                },
+            }),
+        }));
+        for (packet, pointers) in [
             (
-                "control packet",
-                serde_json::json!({
-                    "type": "client_decision",
-                    "session_allowed": true,
-                    "key_installed": false,
-                    "note": null,
-                    "unexpected": true,
-                }),
+                hello,
+                vec![
+                    "",
+                    "/metadata",
+                    "/metadata/platform",
+                    "/reconnect",
+                    "/reconnect/settings",
+                ],
             ),
             (
-                "client metadata",
-                serde_json::json!({
-                    "type": "client_hello",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "metadata": {
-                        "hostname": "workstation",
-                        "username": "engineer",
-                        "working_directory": "/workspace",
-                        "platform": {
-                            "operating_system": "linux",
-                            "architecture": "x86_64",
-                        },
-                        "unexpected": true,
-                    },
-                }),
+                network_request("consumer"),
+                vec!["", "/capability", "/capability/policy"],
             ),
             (
-                "platform",
-                serde_json::json!({
-                    "type": "client_hello",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "metadata": {
-                        "hostname": "workstation",
-                        "username": "engineer",
-                        "working_directory": "/workspace",
-                        "platform": {
-                            "operating_system": "linux",
-                            "architecture": "x86_64",
-                            "unexpected": true,
-                        },
-                    },
+                ControlPacket::AccessDecision(AccessDecision {
+                    session_allowed: true,
+                    key_installed: false,
+                    note: None,
                 }),
+                vec![""],
             ),
-            (
-                "offered session",
-                serde_json::json!({
-                    "type": "server_offer",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "operator_name": "support",
-                    "session": {
-                        "mode": "socks",
-                        "unexpected": true,
-                    },
-                }),
-            ),
-            (
-                "VPN scope",
-                serde_json::json!({
-                    "type": "server_offer",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "operator_name": "support",
-                    "session": {
-                        "mode": "vpn",
-                        "scope": {
-                            "kind": "system",
-                            "policy": { "include_cidrs": [], "include_domains": [] },
-                            "unexpected": true,
-                        },
-                    },
-                }),
-            ),
-            (
-                "system VPN policy",
-                serde_json::json!({
-                    "type": "server_offer",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "operator_name": "support",
-                    "session": {
-                        "mode": "vpn",
-                        "scope": {
-                            "kind": "system",
-                            "policy": {
-                                "include_cidrs": [],
-                                "include_domains": [],
-                                "unexpected": true,
-                            },
-                        },
-                    },
-                }),
-            ),
-        ];
-
-        for (layer, encoded) in cases {
-            assert!(
-                serde_json::from_value::<ControlPacket>(encoded).is_err(),
-                "{layer} accepted an unknown field"
-            );
+        ] {
+            let encoded = serde_json::to_value(packet).unwrap();
+            assert!(serde_json::from_value::<ControlPacket>(encoded.clone()).is_ok());
+            for pointer in pointers {
+                let mut invalid = encoded.clone();
+                invalid
+                    .pointer_mut(pointer)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("unexpected".to_string(), serde_json::json!(true));
+                assert!(
+                    serde_json::from_value::<ControlPacket>(invalid).is_err(),
+                    "accepted unknown field at {pointer}"
+                );
+            }
         }
     }
 
     #[test]
-    fn displayed_client_username_must_be_nonblank_bounded_and_terminal_safe() {
+    fn displayed_peer_username_must_be_nonblank_bounded_and_terminal_safe() {
         for username in [
             " ".to_string(),
             "user\nspoof".to_string(),
             "user\u{202e}spoof".to_string(),
             "u".repeat(MAX_DISPLAY_LABEL_BYTES + 1),
         ] {
-            let packet = ControlPacket::ClientHello(ClientHello {
+            let packet = ControlPacket::PeerHello(Box::new(PeerHello {
+                network_policy: None,
+                role: super::PeerRole::Provider,
+                node_id: "11111111111111111111111111111111".to_string(),
+                route: vec!["11111111111111111111111111111111".to_string()],
                 protocol_version: PROTOCOL_VERSION,
                 reconnect: None,
-                metadata: ClientMetadata {
+                metadata: PeerMetadata {
                     hostname: "workstation".to_string(),
                     username,
                     working_directory: "/workspace".to_string(),
                     platform: Platform::current().unwrap(),
                 },
-            });
+            }));
             assert!(packet.validate().is_err());
         }
     }
@@ -625,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn send_packet_rejects_invalid_display_text_before_writing() {
         let (mut sender, _receiver) = websocket_pair().await;
-        let packet = system_vpn_offer("support\u{202e}hidden");
+        let packet = network_request("support\u{202e}hidden");
 
         let error = send_packet(&mut sender, &packet).await.unwrap_err();
 
@@ -636,10 +625,11 @@ mod tests {
     async fn recv_packet_rejects_invalid_display_text_before_returning_it() {
         let (mut sender, mut receiver) = websocket_pair().await;
         let encoded = serde_json::json!({
-            "type": "server_offer",
+            "type": "access_request",
             "protocol_version": PROTOCOL_VERSION,
-            "operator_name": "support\u{001b}[2J",
-            "session": { "mode": "socks" },
+            "consumer_name": "support\u{001b}[2J",
+            "forwarding": false,
+            "capability": { "kind": "network", "policy": { "kind": "unrestricted" } },
         })
         .to_string();
         sender.send(Message::Text(encoded.into())).await.unwrap();
@@ -647,7 +637,8 @@ mod tests {
         let error = recv_packet(&mut receiver).await.unwrap_err();
 
         assert!(
-            format!("{error:#}").contains("server offer operator name contains a terminal control")
+            format!("{error:#}")
+                .contains("access request consumer name contains a terminal control")
         );
     }
 
@@ -669,20 +660,24 @@ mod tests {
     #[test]
     fn control_packet_debug_output_does_not_render_unvalidated_metadata() {
         let attacker_value = "workstation\u{202e}hidden";
-        let packet = ControlPacket::ClientHello(ClientHello {
+        let packet = ControlPacket::PeerHello(Box::new(PeerHello {
+            network_policy: None,
+            role: super::PeerRole::Provider,
+            node_id: "11111111111111111111111111111111".to_string(),
+            route: vec!["11111111111111111111111111111111".to_string()],
             protocol_version: PROTOCOL_VERSION,
             reconnect: None,
-            metadata: ClientMetadata {
+            metadata: PeerMetadata {
                 hostname: attacker_value.to_string(),
                 username: "engineer".to_string(),
                 working_directory: "/workspace".to_string(),
                 platform: Platform::current().unwrap(),
             },
-        });
+        }));
 
         let displayed = format!("{packet:?}");
 
-        assert_eq!(displayed, "ClientHello");
+        assert_eq!(displayed, "PeerHello");
         assert!(!displayed.contains(attacker_value));
     }
 
@@ -703,5 +698,35 @@ mod tests {
 
         assert!(displayed.contains("peer closed the websocket with an unsafe reason"));
         assert!(!displayed.contains(unsafe_reason));
+    }
+    #[test]
+    fn provider_routes_reject_cycles_and_consumers_cannot_advertise_egress() {
+        let mut hello = PeerHello {
+            role: super::PeerRole::Provider,
+            network_policy: None,
+            node_id: "11111111111111111111111111111111".to_string(),
+            route: vec!["11111111111111111111111111111111".to_string(); 2],
+            protocol_version: PROTOCOL_VERSION,
+            reconnect: None,
+            metadata: PeerMetadata {
+                hostname: "host".to_string(),
+                username: "user".to_string(),
+                working_directory: "/".to_string(),
+                platform: Platform::current().unwrap(),
+            },
+        };
+        assert!(
+            ControlPacket::PeerHello(Box::new(hello.clone()))
+                .validate()
+                .is_err()
+        );
+        hello.route.clear();
+        hello.role = super::PeerRole::Consumer;
+        hello.network_policy = Some(NetworkPolicy::unrestricted());
+        assert!(
+            ControlPacket::PeerHello(Box::new(hello))
+                .validate()
+                .is_err()
+        );
     }
 }

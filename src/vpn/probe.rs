@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use tokio::net::UdpSocket;
 
 use super::configuration::VpnNetworkConfiguration;
-use super::policy::SystemVpnPolicy;
+use crate::NetworkPolicy;
 
 const DNS_HEADER_BYTES: usize = 12;
 const DNS_TYPE_A: u16 = 1;
@@ -16,14 +16,14 @@ const DNS_RESPONSE_CODE: u16 = 0x000f;
 const HEALTH_PAYLOAD_BYTES: usize = 32;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-const FULL_TUNNEL_PROBE_NAME: &str = "sshportal-health-check.invalid";
+const FULL_TUNNEL_PROBE_NAME: &str = "bifrost-health-check.invalid";
 
 pub(super) async fn verify_data_plane(
     network: VpnNetworkConfiguration,
-    policy: &SystemVpnPolicy,
+    policy: &NetworkPolicy,
 ) -> Result<()> {
     verify_tun_round_trip(IpAddr::V4(network.gateway_ipv4)).await?;
-    if policy.requires_ipv6_tunnel() {
+    if policy.allows_ipv6() {
         verify_tun_round_trip(IpAddr::V6(network.gateway_ipv6)).await?;
     }
     let Some(synthetic) = network.synthetic else {

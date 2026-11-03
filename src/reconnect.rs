@@ -95,15 +95,8 @@ impl fmt::Debug for ReconnectSecret {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconnectHello {
-    pub client_identity: ReconnectSecret,
-    pub server_identity: Option<ReconnectSecret>,
-    pub settings: ReconnectSettings,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReconnectOffer {
-    pub server_identity: ReconnectSecret,
+    pub identity: ReconnectSecret,
+    pub peer_identity: Option<ReconnectSecret>,
     pub settings: ReconnectSettings,
 }
 

@@ -1,297 +1,175 @@
-# sshportal
+# Bifrost
 
-`sshportal` turns one user-approved WebSocket attachment into a temporary remote-support session. The operator chooses exactly one session mode, and the client user sees and approves that capability before it becomes active.
+Bifrost shares temporary, consent-gated SSH and network access between peers over WebSockets.
+One executable, `bifrost`, runs on Linux, macOS, and Windows. A native iPhone and iPad app provides
+foreground network egress.
 
-| Mode | Operator-side interface | Client-side privilege | Traffic carried |
-| --- | --- | --- | --- |
-| SSH | Local SSH listener | None | Shells, commands, and optional SSH dynamic forwarding |
-| SOCKS | Local SOCKS5 listener | None | TCP `CONNECT` and UDP `ASSOCIATE` |
-| VPN | System TUN interface | None | Internet-bound IPv4/IPv6 TCP, UDP, and DNS |
+Capability roles and connection roles are independent:
 
-The project ships two binaries:
+| Capability role | Responsibility | Connection choices |
+| --- | --- | --- |
+| Provider | Supplies approved access to its environment | Connect or listen |
+| Consumer | Uses a provider through SSH, SOCKS, or a system VPN | Connect or listen |
+| Relay | Consumes an approved upstream network and provides it to downstream peers | Connect or listen upstream; listen downstream |
 
-- `sshportal-server` hosts the consent-gated rendezvous endpoint and exposes the selected capability on the operator's machine.
-- `sshportal-client` connects back, presents the requested capability for consent, and provides network or shell access from the client environment.
+The side accepting a WebSocket does not determine which environment supplies access. Providers
+approve access before capability execution begins. Consumers choose the requested capability.
 
-The server accepts one client at a time. With reconnection disabled, it closes the HTTP listener
-after consent and keeps only that session's WebSocket alive. Automatic reconnection keeps the
-rendezvous available for the approved client while the endpoint processes remain running. There
-is no persistent client daemon or multi-session broker.
+## Connecting peers
 
-The server generates a fresh random join token on each launch. To supply a token in any session
-mode, use `--join-token`:
+A listening provider with a connecting consumer:
 
-```bash
-sshportal-server --join-token 'my-shared-token'
-```
-
-The token must be nonempty and is used exactly as supplied, including whitespace and special
-characters. The printed WebSocket URL encodes the complete token for the client; when using a public
-HTTPS origin, preserve that URL's encoded `token` query parameter. Client consent is still required.
-
-## Automatic Reconnection
-
-Enable `--reconnect` on both endpoints to recover dropped connections in SSH, SOCKS, or VPN mode:
-
-```bash
-sshportal-server --socks-only 127.0.0.1:1080 --reconnect
-sshportal-client --server 'https://support.example?token=<printed-token>' --reconnect
-```
-
-The default retry interval is **5 seconds**, and each recovery window lasts **300 seconds**.
-Override either value with `--reconnect-interval-seconds` and `--reconnect-timeout-seconds` on
-either endpoint. Both require `--reconnect`, accept whole seconds from 1 to 86400, and require an
-interval shorter than the timeout. The peers negotiate the slower interval and shorter timeout;
-settings with no shared recovery window are rejected. The client also retries initial connection
-failures within its own configured window. The server's initial wait for its first client has no
-deadline. When only one endpoint enables the mode, an approved session remains a single connection.
-
-Recovery starts after transport loss is detected and session teardown finishes. Connection attempts,
-handshakes, and delays share an absolute deadline, so failed attempts cannot extend a recovery
-window. A successful approved handshake starts a new transport epoch. Network keepalives detect
-silent transport failures; detection time is separate from the recovery timeout.
-
-The initial consent prompt explicitly includes reconnection. The running client retains that
-approval only for the same server process, operator identity, SSH key or network policy, and
-reconnection settings. A private, randomly generated client credential binds resumption to the
-approved client; knowing the original join token does not permit another client to take over.
-Resume credentials stay in memory, are absent from URLs and debug output, and are checked using
-constant-time comparison. Restarting either process requires a new initial session and consent.
-Consent denial, invalid TLS certificates, changed capabilities, and local configuration or cleanup
-failures stop recovery. Ctrl-C, SIGTERM/SIGHUP on POSIX, or Ctrl-Break on Windows stops the process.
-
-The local SSH/SOCKS ports and SSH proxy host key stay stable across transports. Each VPN transport
-installs its own host-network transaction and restores routes and DNS before recovery begins.
-During an outage, the host's ordinary routing applies; this mode does not provide a kill switch.
-VPN address ranges and synthetic DNS mappings retain their identity so cached addresses continue
-to identify the same hostnames. A newly conflicting host route stops recovery rather than changing
-those address identities.
-
-Recovery restores access for **new connections**. Existing TCP/UDP flows and interactive SSH shells
-end with the dropped transport; they are not replayed or resumed. Both binaries must implement
-control protocol version 9.
-
-## SSH Mode
-
-SSH is the default mode:
-
-```bash
-sshportal-server \
-  --listen 0.0.0.0:8080 \
-  --operator-name support-team \
-  --ssh-listen 127.0.0.1:2222
-```
-
-Give the printed tokenized URL to the client user:
-
-```bash
-sshportal-client \
-  --server "http://server-host:8080?token=<printed-token>"
-```
-
-After approval, connect to the local operator-side listener:
-
-```bash
-ssh -p 2222 client-username@127.0.0.1
-```
-
-If `--ssh-listen` is omitted, the server chooses a free loopback port and prints it after the session is established.
-
-### Persistent operator keys
-
-Sessions are ephemeral by default. To separately request permission to install an existing operator key on a POSIX client:
-
-```bash
-sshportal-server \
-  --operator-key /path/to/id_ed25519 \
-  --persist-operator-key
-```
-
-Windows clients keep SSH sessions ephemeral because persistent `authorized_keys` installation is not supported there.
-
-When consent has already been handled out of band, the client can use `--approve-session` and, for a requested persistent key, `--approve-key-install`.
-
-### SSH-backed SOCKS forwarding
-
-SSH mode can expose an additional SOCKS5 listener backed by SSH `direct-tcpip` channels:
-
-```bash
-sshportal-server \
-  --ssh-listen 127.0.0.1:2222 \
-  --dynamic-forward 127.0.0.1:1080
-```
-
-This listener supports TCP `CONNECT`, like `ssh -D`. The SSH listener and SOCKS listener remain available for the same approved session.
-
-## SOCKS Mode
-
-`--socks-only` skips SSH entirely and multiplexes SOCKS traffic directly over the WebSocket:
-
-```bash
-sshportal-server \
-  --listen 0.0.0.0:8080 \
-  --operator-name support-team \
+```sh
+bifrost provide --listen 0.0.0.0:7071 --join-token 'shared-token'
+bifrost access --connect 'ws://provider-host:7071/connect?token=shared-token' \
   --socks-only 127.0.0.1:1080
 ```
 
-The client connects normally. Once the user approves the SOCKS-specific prompt, applications on the operator machine can use the listener:
+A listening consumer with a connecting provider:
 
-```bash
+```sh
+bifrost access --listen 0.0.0.0:7071 --join-token 'shared-token' \
+  --socks-only 127.0.0.1:1080
+bifrost provide --connect 'ws://consumer-host:7071/connect?token=shared-token'
+```
+
+Both arrangements expose the same network capability. Replace `--socks-only` with `--vpn` for
+system routing, or omit both to request SSH access. The provider sees the consumer label, requested
+capability, and network selectors before granting access.
+
+Choose exactly one of `--connect URL` and `--listen ADDRESS`. A listener generates a random join
+token when `--join-token` is omitted. Explicit tokens preserve whitespace and special characters;
+the printed join URL percent-encodes them. Listeners expose generic status at `/` and `/healthz`.
+
+Listening providers admit up to 32 independent peer sessions, with serialized terminal consent and
+bounded HTTP and negotiation admission. Each consumer invocation attaches one provider to its local
+frontend. `--approve-session` explicitly bypasses the provider's live consent prompt; persistent SSH
+key installation has a separate `--approve-key-install` decision.
+
+## Sharing an upstream network
+
+A relay forwards TCP, UDP, and resolver requests through one approved upstream provider. It has no
+local egress fallback. Upstream approval explicitly includes downstream forwarding, and each
+subsequent hop grants its own access. Relays terminate each transport and are trusted with forwarded traffic. Every hop enforces the requested scope; an upstream denial
+reaches the final consumer.
+
+```sh
+# Environment whose network supplies the destinations.
+bifrost provide --listen 0.0.0.0:7071 --join-token 'origin'
+
+# Intermediate environment. Approval at the origin includes forwarding.
+bifrost relay --connect 'wss://origin.example/connect?token=origin' \
+  --relay-listen 0.0.0.0:7072 --relay-join-token 'relay'
+
+# Another peer uses the origin's network through the intermediary.
+bifrost access --connect 'ws://relay-host:7072/connect?token=relay' \
+  --socks-only 127.0.0.1:1080
+```
+
+Additional relays may connect to that intermediary. Each relay accepts up to 32 downstream sessions
+and shares the upstream session's aggregate flow limits. Provider routes carry process-scoped node
+IDs, reject cycles, and contain at most 16 nodes. Route selection follows the explicitly connected
+upstream; there is no discovery service or routing mesh. Route advertisements describe cooperative
+forwarding topology, not cryptographic proof of a destination's identity.
+
+Use `--include-cidr` and `--include-domain` on a relay to restrict the upstream access it
+requests. Downstream consumers intersect their requested scope with the advertised upstream grant.
+VPN frontends install that effective scope, and disjoint requests fail before routing starts.
+Relays provide network access;
+an SSH shell capability belongs to the particular host granting it. Ordinary SSH connections can
+travel through a relayed SOCKS or VPN network.
+
+## SSH access
+
+```sh
+bifrost access --listen 0.0.0.0:7071 --ssh-listen 127.0.0.1:2222
+bifrost provide --connect 'wss://support.example/connect?token=<printed-token>'
+```
+
+After approval, the consumer prints the username and SSH command for its local proxy. Omit
+`--ssh-listen` to select a free loopback port. The proxy preserves remote request acknowledgements,
+PTY allocation, window changes, command output, exit status, and multiple SSH sessions over one
+approved transport. The provider hosts an embedded SSH service and requires no system SSH daemon.
+
+An ephemeral consumer key is generated by default. To request separate approval to install an
+existing key persistently on a POSIX provider:
+
+```sh
+bifrost access --listen 0.0.0.0:7071 \
+  --consumer-key /path/to/id_ed25519 --persist-consumer-key
+```
+
+Windows and iOS do not install persistent SSH keys. The iOS app does not provide SSH shell access.
+
+SSH mode can additionally expose a TCP-only SOCKS listener using SSH `direct-tcpip` channels:
+
+```sh
+bifrost access --connect 'wss://provider.example/connect?token=<token>' \
+  --ssh-listen 127.0.0.1:2222 --dynamic-forward 127.0.0.1:1080
+```
+
+## SOCKS access
+
+`--socks-only ADDRESS` exposes SOCKS5 TCP `CONNECT` and UDP `ASSOCIATE` over the approved network
+session, without SSH. Destination names resolve at the final provider, including across relays.
+
+```sh
 curl --proxy socks5h://127.0.0.1:1080 https://example.com
 ```
 
-SOCKS mode supports TCP `CONNECT` and UDP `ASSOCIATE`. Destination names are resolved from the client environment, so both protocols use the client's network path. It does not generate SSH keys, launch a shell, start an SSH server, or place traffic inside SSH channels.
+The SOCKS listener is unauthenticated. Bind it to loopback unless other hosts should deliberately
+be able to use the approved network.
 
-The listener is unauthenticated. Keep it on loopback unless other machines should deliberately be able to use the client's network. SOCKS mode warns when it is negotiated over plain WS because its confidentiality then depends entirely on the surrounding network.
+## System VPN
 
-## VPN Mode
-
-### System-wide VPN
-
-System-wide VPN mode gives ordinary applications on the operator machine a path through the client without requiring proxy configuration in each application:
+The consumer's ordinary applications use a virtual network interface:
 
 ```text
-operator applications
-        |
-        v
-operator TUN -> in-process TCP/UDP endpoint -> bounded HTTP/2 session
-             -> approved WebSocket -> client sockets and system resolver
+consumer applications
+    -> platform packet interface
+    -> in-process TCP/UDP endpoint
+    -> bounded HTTP/2 session inside the approved WebSocket
+    -> optional relay hops
+    -> provider sockets and native resolver
 ```
 
-The TUN interface and routes exist only on the operator side. SSHPortal terminates TCP locally with
-`smoltcp`, and it does not complete an application's TCP handshake until the client has opened the
-real destination. TCP streams use HTTP/2 `CONNECT`; UDP flows use Extended CONNECT and
-RFC 9297/9298 capsules. All network streams share one bounded HTTP/2 connection carried inside the
-already-approved WebSocket. The client opens ordinary outbound sockets and requires no
-administrator privileges, kernel extension, TUN driver, or route changes.
-
-The server reports a VPN as active only after dual-stack UDP health probes have completed a full
-kernel-to-TUN round trip. Sessions with virtual DNS also complete a resolver query through the
-WebSocket and the client's native resolver before startup succeeds. A platform framing mismatch,
-an unusable IPv4 or IPv6 interface, or a broken resolver path therefore fails startup and restores
-the host network state instead of leaving a connected-looking but inert VPN.
-
-Start the server as root on Linux or macOS, or from an elevated terminal on Windows:
-
-```bash
-sudo sshportal-server \
-  --listen 127.0.0.1:8080 \
-  --operator-name support-team \
-  --vpn
+```sh
+sudo bifrost access --connect 'wss://provider.example/connect?token=<token>' --vpn
 ```
 
-With no selectors, `--vpn` is a full tunnel. Supplying any include selector changes it to an
-allowlist split tunnel. Repeat either option as needed; CIDR and domain selectors have union
-semantics:
+With no selectors, `--vpn` routes internet-bound IPv4, IPv6, TCP, UDP, and DNS traffic through the
+provider. Include selectors form an allowlist split tunnel, with union semantics:
 
-```bash
-sudo sshportal-server \
-  --listen 127.0.0.1:8080 \
-  --operator-name support-team \
-  --vpn \
-  --vpn-include-cidr 10.20.0.0/16 \
-  --vpn-include-cidr 2001:db8:1200::/48 \
-  --vpn-include-domain elevancehealth.com \
-  --vpn-include-domain anthem.com
+```sh
+sudo bifrost access --listen 0.0.0.0:7071 --vpn \
+  --include-cidr 10.20.0.0/16 \
+  --include-domain example.com
 ```
 
-A domain selector includes its apex and every subdomain, so `anthem.com` also selects
-`login.anthem.com`; wildcard syntax is not accepted. Domain names are normalized to lowercase
-ASCII/IDNA form, and CIDRs are normalized to their network address. Everything that matches none
-of the selectors continues over the operator machine's normal network path.
+Domain selectors include their apex and all subdomains, use normalized ASCII/IDNA names, and do not
+accept wildcard syntax. Unselected traffic remains on the physical network. Domain policies use a
+session-scoped synthetic resolver so a selected hostname remains associated with its original
+name and address family when the provider opens a destination. CIDR-only policies do not alter DNS.
 
-Domain routing uses the operating system's split-DNS facility rather than resolving a hostname
-once and pinning its current addresses. Queries for selected suffixes go to session-specific
-virtual IPv4 and IPv6 resolvers. Over dedicated bounded HTTP/2 streams, SSHPortal asks the client's
-platform resolver whether the original fully qualified name has an address in the requested
-family. This preserves macOS scoped resolvers, Windows NRPT, corporate VPN DNS, hosts-file entries,
-and other native resolver policy. The client sends back only a positive or negative result and a
-short synthetic TTL, never the real addresses or aliases. SSHPortal returns a stable synthetic
-address directly at the original queried name; a later connection is reversed to that same
-hostname before the client resolves and opens it. Connections through an A-derived synthetic
-address remain IPv4-only, and connections through an AAAA-derived address remain IPv6-only. Real
-destination addresses therefore never need to become routes on the operator machine, and a CNAME
-cannot escape the approved suffix by becoming a separately routable synthetic name.
+The consumer creates the TUN interface and owns transactional route/DNS configuration. The
+provider opens ordinary outbound sockets and requires no elevation. TCP is terminated locally
+with `smoltcp`; its handshake completes only after the provider opens the destination. TCP uses
+HTTP/2 `CONNECT`; UDP uses Extended CONNECT and RFC 9297/9298 capsules. A relay forwards those
+streams with bounded buffering and releases receive credit only after the next hop admits bytes.
 
-The IPv4 synthetic pool is a collision-checked `/16` selected from the RFC 2544 benchmarking range
-(`198.18.0.0/16` or `198.19.0.0/16`); the IPv6 pool is a session-specific ULA `/96`. SSHPortal
-refuses to start domain or full-tunnel DNS when it cannot allocate non-conflicting pools. In
-selective mode, unselected DNS queries continue to use the operator's normal resolvers. A
-CIDR-only policy allocates no synthetic pools and does not change DNS configuration.
-
-VPN mode accepts HTTP/WS and HTTPS/WSS URLs. Use HTTPS/WSS to encrypt the portal connection. `sshportal-server` deliberately remains a small HTTP/WS server,
-so terminate TLS with a reverse proxy and forward the WebSocket to its listener over a trusted
-backend hop:
-
-```text
-sshportal-client -> wss://support.example/connect -> TLS reverse proxy
-                 -> private backend hop -> ws://operator-host:8080/connect
-```
-
-For VPN routing, SSHPortal trusts only the address of the TCP socket that actually carries its
-WebSocket. It installs a physical-path exception for that immediate peer and deliberately ignores
-`Forwarded` and `X-Forwarded-For`; client-controlled headers must never be allowed to create host
-route exceptions. An off-host TLS proxy works naturally because it is the immediate socket peer.
-A proxy on the operator machine needs its client-facing connection independently excluded from a
-full-tunnel route, so an off-host proxy is the simpler full-tunnel topology. Selective policies do
-not need an extra exception when the local proxy's peer is outside every selected prefix. Keep an
-off-host proxy's unencrypted backend hop on a trusted private network or inside a separate encrypted
-tunnel.
-
-Use the token printed by the server with the public HTTPS origin:
-
-```bash
-sshportal-client \
-  --server "https://support.example?token=<printed-token>"
-```
-
-With HTTP/WS, portal traffic and the join token are unencrypted. Use plain WS only
-on a trusted network or inside a separately secured tunnel. WSS servers and HTTPS proxies are verified against the platform
-trust policy. On Windows and macOS, that includes locally installed enterprise roots and
-operating-system distrust decisions; copying the same executable to another machine does not carry
-a private bundled CA snapshot with it.
-
-For a private CA that cannot or should not be installed into the operating-system trust store, add
-its PEM certificate directly to this client process:
-
-```bash
-sshportal-client \
-  --server "https://support.example?token=<printed-token>" \
-  --tls-ca-certificate /path/to/private-root.pem
-```
-
-The option may be repeated, and each file may contain a PEM certificate bundle. These roots augment
-rather than replace platform verification for both the WSS server and an HTTPS proxy. Hostname,
-validity-period, signature, and chain validation remain mandatory. No certificate is installed into
-an operating-system keychain or trust store.
-
-The approved capability is enforced again for every client-side network stream before DNS or
-socket creation. SOCKS sessions permit arbitrary TCP and UDP destinations but no
-resolver streams. Full system VPN permits arbitrary destinations and resolver names. A selective
-system VPN permits literal addresses only inside its approved CIDRs and hostnames or resolver names
-only inside its approved suffixes; a CIDR-only session cannot use the resolver endpoint.
-
-### Routing behavior
-
-Full-tunnel system VPN mode installs IPv4 and IPv6 split-default routes through the TUN and makes
-both virtual resolvers the system's default DNS path. Selective mode installs only the requested
-CIDR routes plus the virtual IPv4 and IPv6 pools when domain selectors are present. Both modes pin
-the WebSocket's immediate socket peer to its original physical path; broader selected CIDRs are
-safe because that host route is more specific, but an exact `/32` or `/128` selector for the peer
-is rejected. Existing directly attached networks and loopback remain local unless a more-specific
-selected route deliberately covers them.
-
-On macOS, directly attached peers use interface routes. A network change that requires
-replacing a direct bypass ends the session and restores the network; reconnect to establish
-a path on the new network.
+VPN startup verifies dual-stack UDP through the real kernel/TUN path and, where applicable, a
+query through the synthetic resolver and provider's native DNS. Failure restores host state.
+The transport peer is excluded from tunnel routing. On macOS, directly attached peers use
+interface routes; a network change requiring their replacement ends the session and restores the
+network so a fresh connection can establish the new path.
 
 This is intentionally a TCP/UDP application tunnel rather than a general IP router. Its important
 boundaries are:
 
 - ICMP, multicast, raw IP, and unsolicited inbound listeners are not carried. `ping`, service
   discovery, and protocols built directly on IP do not behave as they do on WireGuard or IPsec.
-- The client creates new outbound sockets, so the destination observes the client's source address,
-  not the operator's. Existing flows cannot resume after WebSocket or HTTP/2 transport loss.
+- The provider creates new outbound sockets, so the destination observes the provider's source address,
+  rather than the consumer's. Existing flows cannot resume after WebSocket or HTTP/2 transport loss.
 - UDP datagram boundaries and FIFO order are preserved, but HTTP/2 makes delivery ordered rather
   than native-UDP unordered. Bounded queues may discard UDP under sustained pressure; TCP applies
   backpressure instead.
@@ -307,11 +185,11 @@ boundaries are:
   poisoned until its 60-second expiry, so a sustained train of tiny fragments cannot restart the
   same assembly or retain additional payload memory.
 - The synthetic resolver is designed around address discovery. It synthesizes A and AAAA directly
-  at the original queried name after the client's native resolver confirms that address family.
+  at the original queried name after the provider's native resolver confirms that address family.
   CNAME, HTTPS, and SVCB receive alias-free NODATA, and unsupported record types receive NOTIMP;
   arbitrary DNS records are not proxied.
 - Platform `getaddrinfo` errors do not reliably distinguish NXDOMAIN from family-specific NODATA:
-  `dns-lookup` can report either as `NoName`. SSHPortal conservatively returns NOERROR/NODATA in
+  `dns-lookup` can report either as `NoName`. Bifrost conservatively returns NOERROR/NODATA in
   both cases instead of allowing one failed family lookup to suppress a valid lookup for the other
   family. Consequently, synthetic DNS does not preserve authoritative NXDOMAIN semantics.
 
@@ -333,198 +211,117 @@ Hostname selection necessarily has a few edges:
   match. Restart the application or clear its DNS cache after changing a policy.
 - A selected site can depend on identity, API, or CDN names under unrelated domains. Those suffixes
   need their own selectors.
-- Synthetic answers are unsigned, and SSHPortal does not proxy the DNSSEC records needed to
-  authenticate them. Strict operator-side DNSSEC validation can therefore reject selected names.
-- One of `198.18.0.0/16` and `198.19.0.0/16` is reserved for SSHPortal's virtual names while domain
+- Synthetic answers are unsigned, and Bifrost does not proxy the DNSSEC records needed to
+  authenticate them. Strict consumer-side DNSSEC validation can therefore reject selected names.
+- One of `198.18.0.0/16` and `198.19.0.0/16` is reserved for Bifrost's virtual names while domain
   selection is active, so that selected `/16` cannot simultaneously represent real destinations.
 
-### Platform requirements
+## Platform requirements
 
-- Linux needs root, access to `/dev/net/tun`, `CAP_NET_ADMIN`, and the `ip` command from `iproute2`.
-  `CAP_NET_ADMIN` alone is insufficient because SSHPortal also owns private crash-recovery state
-  under `/var/run`. Full tunnel and domain-selective policies additionally require
-  systemd-resolved and `resolvectl`; SSHPortal fails closed instead of silently sending tunneled
-  DNS to the normal resolver when they are unavailable.
-- macOS needs root privileges to configure the `utun` routes. Full tunnel and domain-selective
-  policies use a process-session-scoped resolver in the SystemConfiguration dynamic store.
-- Windows requires Windows 10 version 1607 or later. Interactive SSH shells additionally require
-  version 1809 or later for ConPTY support. System VPN mode needs an elevated terminal
-  and the signed `wintun.dll` beside `sshportal-server.exe`.
-  Full tunnel and domain-selective policies use a session-unique local NRPT rule. Official Windows
-  release archives include the DLL and its redistribution license. Before loading Wintun,
-  SSHPortal checks the bundled DLL against a pinned architecture-specific SHA-256, stages a fresh
-  copy under `%ProgramData%\SSHPortal` with a protected Administrators-and-SYSTEM-only ACL, and
-  locks both the directory and file against replacement. It verifies the exact locked file's hash,
-  Authenticode trust, and `WireGuard LLC` publisher, and holds those locks until the Windows loader
-  has opened the DLL.
+- Linux VPN consumers need root, `/dev/net/tun`, `CAP_NET_ADMIN`, and `iproute2`. Full-tunnel and
+  domain policies additionally require `systemd-resolved` and `resolvectl`.
+- macOS VPN consumers need root to configure `utun`, routes, and system DNS. Standalone desktop
+  binaries require no Apple Developer membership or provisioning profile.
+- Windows VPN consumers need elevation and the signed `wintun.dll` beside `bifrost.exe`. Release
+  archives include the pinned DLL and its redistribution license. Bifrost verifies its signature,
+  trusted signer, architecture, and file identity before loading it and restricts DLL resolution
+  to Windows system directories. Provider-only and SOCKS/SSH modes do not need Wintun.
 
-Only the operator-side server needs these privileges and platform components. A Windows machine running only `sshportal-client.exe` does not need elevation or `wintun.dll`.
+## Transport security and recovery
 
-## Build and test
+HTTP/WS and HTTPS/WSS join URLs are accepted. Plain WS exposes portal traffic and the join token;
+use it on trusted networks or within a separately encrypted tunnel. A listener serves HTTP/WS;
+terminate public TLS at a reverse proxy and forward its WebSocket to the listener over a trusted
+backend connection. Account for both sides of a local reverse proxy when configuring VPN bypasses;
+an off-host TLS proxy is the simpler full-tunnel topology.
 
-The minimum supported Rust version is 1.91.
+Dialers honor HTTP proxy environment variables and `NO_PROXY`. WSS peers and HTTPS proxies use
+platform certificate verification, including locally installed trust roots and distrust policy.
+`--tls-ca-certificate PATH` adds every PEM certificate in a bundle for that invocation and may be
+repeated. HTTPS proxies and destination WSS connections are verified independently.
 
-Both binaries build natively on Linux, macOS, and Windows. CI compiles and tests the Rust code on
-all three operating systems, cross-builds the static-CRT Windows package from macOS, and runs
-privileged system-VPN end-to-end paths in Linux containers and on a native macOS host.
+Enable `--reconnect` on both endpoints for bounded recovery. Intervals and outage windows negotiate
+to mutually supported values. Retained approval is tied to the same process identities, metadata,
+capability, and provider route. A different peer or changed request requires fresh approval.
+Rejected handshakes do not extend an existing recovery deadline. Routes and DNS are restored before
+another VPN transport is installed. Reconnection restores access for new flows; TCP, UDP, and SSH
+sessions from a lost connection are not replayed. Relay transport loss tears down its downstream
+sessions; approved peers may reconnect within their negotiated windows after upstream recovery.
 
-```bash
-cargo build --bins
-cargo fmt --all --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-```
+All peers use control protocol version 10. After approval, nonempty binary WebSocket messages
+carry byte-stream data; an empty binary message ends that direction. Reverse traffic remains
+available after write shutdown. The transport driver owns final cleanup, with bounded draining
+when an application drops a completed write half. An early WebSocket close is a transport failure.
 
-The Docker-backed Linux end-to-end harnesses are [`tools/docker_e2e.py`](tools/docker_e2e.py) for
-SSH and [`tools/docker_vpn_e2e.py`](tools/docker_vpn_e2e.py) for the isolated
-WSS/TUN/TCP/UDP/DNS path. The VPN fixture runs a real DBus and systemd-resolved control plane and
-checks full-tunnel, CIDR-selective, and domain-selective routing. Its `echo.test` name exists only
-on the client network, so the domain case verifies resolver suffix routing, synthetic-address
-hostname reversal, and both TCP and UDP client-side name resolution.
+## Native iOS app
 
-[`tools/macos_vpn_e2e.py`](tools/macos_vpn_e2e.py) runs the release server against a real native
-`utun` and the release client over a locally terminated WSS connection. It verifies macOS
-SystemConfiguration split DNS, UDP and TCP DNS over IPv4 and IPv6, stable synthetic A and AAAA
-answers, dual-stack TCP and UDP egress, CIDR-only readiness, unmatched-route preservation, and
-cleanup after both Ctrl-C and transport failure. The fixture requires passwordless `sudo` because
-the server owns routes. Its short-lived localhost root is passed only to the fixture client through
-`--tls-ca-certificate`; the fixture never reads or mutates a keychain or system trust store.
+`ios/Bifrost.xcodeproj` builds the iPhone and iPad app for iOS 17 and later. It provides approved
+VPN/SOCKS network egress, either by connecting to a consumer or listening for one on its LAN.
+The app serves one foreground peer session. It uses the same Rust negotiation, network policies,
+TLS verification, reconnection, and TCP/UDP implementation as the CLI.
 
-```bash
-python3 tools/macos_vpn_e2e.py
-```
-
-### Static Linux binaries
-
-Build fully static musl binaries for x86-64:
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-CC_x86_64_unknown_linux_musl=musl-gcc \
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-  cargo build --locked --release --target x86_64-unknown-linux-musl --bins
-```
-
-For ARM64, replace the target with `aarch64-unknown-linux-musl` and the variable suffix with `aarch64_unknown_linux_musl`. Native Linux builds can use `musl-gcc`. Cross-builds need the target-prefixed compiler, such as `aarch64-linux-musl-gcc`. The Docker test harness selects an installed compiler automatically.
-
-### Static-CRT Windows binaries
-
-On macOS, install the pinned cross-compiler and Rust target, then run the release builder:
-
-```bash
-brew install llvm lld jq
-rustup toolchain install 1.91.0 \
-  --profile minimal \
-  --target x86_64-pc-windows-msvc
-cargo install --locked --version 0.21.4 cargo-xwin
-tools/build_windows_release.sh
-```
-
-`cargo-xwin` downloads Microsoft CRT and Windows SDK files. Using it accepts [Microsoft's license for those files](https://go.microsoft.com/fwlink/?LinkId=2086102).
-
-The builder compiles both executables with the MSVC ABI and static CRT, verifies their x86-64 PE headers, rejects imports outside the Windows system DLL set, verifies the pinned Wintun DLL, and writes a zip plus its SHA-256 file under `dist/`. This also catches accidental dynamic dependencies on the Visual C++, UCRT, MinGW, or other third-party runtimes.
-
-The equivalent native build from Windows PowerShell is:
-
-```powershell
-rustup target add x86_64-pc-windows-msvc
-$env:RUSTFLAGS = "-C target-feature=+crt-static"
-cargo build --locked --release --target x86_64-pc-windows-msvc --bins
-```
-
-Rust and C/C++ runtime code is statically linked where Windows permits it. Normal Windows system DLLs remain dynamic dependencies, and VPN mode requires the separately packaged `wintun.dll` beside `sshportal-server.exe`. Wintun retains its upstream Authenticode signature and is verified again by the server before loading. The SSHPortal executables themselves remain unsigned unless they are signed separately after the build.
-
-## Container image
-
-The [`Dockerfile`](Dockerfile) packages prebuilt static Linux binaries into a small Alpine image:
-
-```bash
-CC_x86_64_unknown_linux_musl=musl-gcc \
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-  cargo build --locked --release --target x86_64-unknown-linux-musl --bins
-docker buildx build \
-  --platform linux/amd64 \
-  --build-arg TARGET_TRIPLE=x86_64-unknown-linux-musl \
-  --load \
-  -t sshportal:amd64 .
-```
-
-To run VPN mode in a container, also pass `/dev/net/tun` and `CAP_NET_ADMIN`.
-
-## Releases
-
-Pushing a `vX.Y.Z` tag publishes archives for static x86-64 and ARM64 Linux binaries plus
-static-CRT x86-64 Windows binaries. A `vX.Y.Z-windows-x86_64` tag deliberately publishes only the
-Windows archive. Other `v*` tag shapes fail validation rather than producing an empty successful
-workflow. Every release tag must match the Cargo package version, and publication waits for source
-validation plus the native macOS system-VPN test on that exact tagged commit. The Windows archive
-also contains the signed Wintun DLL and [`WINTUN-LICENSE.txt`](licenses/WINTUN.txt). Every archive
-has a SHA-256 checksum file.
-
-On macOS, build the standalone binaries with `cargo build --locked --release --bins`.
-Run `target/release/sshportal-server` and `target/release/sshportal-client` from that
-build. Cargo writes to `target/release`; it does not update extracted archives in `dist`.
-SSH, SOCKS, and system VPN modes do not require an Apple Developer membership or provisioning
-profiles. System VPN mode requires root privileges to configure networking.
-
-## License
-
-`sshportal` is licensed under Apache 2.0. See [`LICENSE`](LICENSE). The separately distributed Wintun binary is governed by its bundled license.
-
-## iOS Client
-
-The native iPhone and iPad app in `ios/SSHPortal.xcodeproj` provides VPN and SOCKS
-**egress**: an approved operator uses this device's network connection. It does not
-install a VPN on the phone, host a portal server, or provide SSH shell access.
-The app and desktop server use control protocol version 9; build both from this
-source tree.
-
-Open the project in Xcode, select the `SSHPortal` scheme, choose your signing team
-under Signing & Capabilities, and run it on your device. The app targets iOS 17 or
-later. Install Rust and the matching targets first:
-
-```bash
+```sh
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-open ios/SSHPortal.xcodeproj
+open ios/Bifrost.xcodeproj
 ```
 
-An Intel simulator additionally requires `x86_64-apple-ios`. Xcode's build phase
-compiles the Rust library and links it into the app. No Network Extension
-entitlement or background mode is needed. For an unsigned device build:
+Select a signing team and run the `Bifrost` scheme on a device. An Intel simulator additionally
+requires `x86_64-apple-ios`. The build phase compiles and links the native Rust static library.
+No Network Extension entitlement is required for providing network egress. The app does not
+install a system VPN on the phone or offer SSH shell access.
 
-```bash
-xcodebuild -project ios/SSHPortal.xcodeproj -scheme SSHPortal \
-  -configuration Release -destination 'generic/platform=iOS' \
-  CODE_SIGNING_ALLOWED=NO build
-```
+Choose Connect and paste a full join URL, or choose Listen and enter the address and join token.
+Allow local-network access when prompted. Private WSS certificate authorities must be installed
+and trusted on the device. Plain connections are identified in the approval prompt. Join URLs and
+tokens are not saved.
 
-Paste the server's complete HTTP/WS or HTTPS/WSS join URL, including its token, then tap
-Connect. The app shows the operator, requested capability, and any VPN address or
-domain restrictions before asking for approval. Both network modes support plain and encrypted connections. The approval prompt
-identifies unencrypted connections. For HTTPS/WSS, certificate validation uses the device's trust settings; private CAs
-must be installed and trusted there. Allow local-network access if iOS asks and
-the portal or requested destinations are on your LAN.
+Keep the app foregrounded. Switching apps or locking the device disconnects, cancels retries,
+and discards approval and resume credentials. Returning to the app does not automatically reconnect.
 
-Keep the app in the foreground for the duration of the session. Switching apps or
-locking the device disconnects, cancels retries, and discards consent and resume
-credentials. Returning to the app does not resume the session. The screen can be
-kept awake during a session with the in-app toggle. Automatic reconnection, when
-enabled on both peers, applies only while the app remains in the foreground.
-Existing TCP and UDP flows still end when their transport is lost.
-
-The app uses the same Rust negotiation, consent retention, reconnect deadlines,
-TLS verification, resolver, policy enforcement, and TCP/UDP session code as the
-terminal client. Swift owns presentation and foreground lifecycle; the native
-boundary in `crates/ios-client` owns one cancellable session per app connection.
-Join URLs and tokens are not saved by the app.
-
-Run the simulator UI checks with:
-
-```bash
-xcodebuild test -project ios/SSHPortal.xcodeproj -scheme SSHPortal \
+```sh
+xcodebuild -project ios/Bifrost.xcodeproj -scheme Bifrost \
+  -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+xcodebuild test -project ios/Bifrost.xcodeproj -scheme Bifrost \
   -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-The live connection test also accepts `TEST_RUNNER_SSHPORTAL_TEST_SERVER_URL`
-when running `xcodebuild test`. Point it at an HTTP/WS portal, or an HTTPS/WSS portal with a certificate trusted
-by that simulator. It checks explicit consent and disconnect-on-background.
+The live UI integration test accepts `TEST_RUNNER_BIFROST_TEST_SERVER_URL`, pointing to a listening
+consumer (for WSS, its certificate must be trusted by that simulator). It checks consent and disconnect-on-background.
+
+## Build and validation
+
+Rust 1.91 or later is required.
+
+```sh
+cargo build --locked --release --bin bifrost
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+```
+
+The executable is `target/release/bifrost` (`bifrost.exe` on Windows). Cargo does not update
+previously extracted archives in `dist`. Release packaging builds one executable per target.
+Windows packages additionally include Wintun and `WINTUN-LICENSE.txt`.
+
+`tools/build_windows_release.sh` cross-builds and validates the x86-64 MSVC release on macOS,
+including static CRT linkage, system-only imports, and pinned Wintun provenance. Linux release
+builds use musl and are checked for static linkage. CI exercises native platforms and the iOS app.
+
+Process-level tests cover both connection directions, SSH recovery, bounded admission, multiple
+relay hops, and concurrent consumers. Kernel VPN checks require elevation:
+
+```sh
+sudo python3 tools/macos_vpn_e2e.py
+sudo python3 tools/macos_vpn_e2e.py --skip-build --dialer consumer
+python3 tools/docker_e2e.py
+python3 tools/docker_vpn_e2e.py --skip-build
+```
+
+The macOS tool exercises the production release binary, real `utun`, WSS, DNS, TCP/UDP, recovery,
+and cleanup. Docker tests cover isolated Linux networks, SSH, and VPN policy routing. Docker VPN
+consumers require `/dev/net/tun`, `CAP_NET_ADMIN`, and the fixture's resolver configuration.
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE). The separately distributed Wintun binary is governed by
+[its bundled license](licenses/WINTUN.txt).

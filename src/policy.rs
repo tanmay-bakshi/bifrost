@@ -5,103 +5,151 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use url::Host;
 
-use super::dns::DnsName;
+use crate::domain::DnsName;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SystemVpnPolicy {
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NetworkPolicy {
+    Unrestricted {},
+    Selected(NetworkSelectors),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NetworkSelectors {
     include_cidrs: Vec<IpNet>,
     include_domains: Vec<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UnvalidatedSystemVpnPolicy {
-    include_cidrs: Vec<IpNet>,
-    include_domains: Vec<String>,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum UnvalidatedNetworkPolicy {
+    Unrestricted {},
+    Selected {
+        include_cidrs: Vec<IpNet>,
+        include_domains: Vec<String>,
+    },
 }
 
-impl SystemVpnPolicy {
+impl NetworkPolicy {
     pub fn new(include_cidrs: Vec<IpNet>, include_domains: Vec<String>) -> Result<Self> {
-        let include_cidrs = normalize_cidrs(include_cidrs);
-        let include_domains = normalize_domains(include_domains)?;
-        Ok(Self {
-            include_cidrs,
-            include_domains,
-        })
-    }
-
-    pub fn full_tunnel() -> Self {
-        Self {
-            include_cidrs: Vec::new(),
-            include_domains: Vec::new(),
+        if include_cidrs.is_empty() && include_domains.is_empty() {
+            return Ok(Self::unrestricted());
         }
+        Self::selected(include_cidrs, include_domains)
     }
 
-    pub fn is_full_tunnel(&self) -> bool {
-        self.include_cidrs.is_empty() && self.include_domains.is_empty()
+    fn selected(include_cidrs: Vec<IpNet>, include_domains: Vec<String>) -> Result<Self> {
+        Ok(Self::Selected(NetworkSelectors {
+            include_cidrs: normalize_cidrs(include_cidrs),
+            include_domains: normalize_domains(include_domains)?,
+        }))
+    }
+
+    pub fn unrestricted() -> Self {
+        Self::Unrestricted {}
+    }
+    pub fn is_unrestricted(&self) -> bool {
+        matches!(self, Self::Unrestricted {})
+    }
+    pub fn is_empty(&self) -> bool {
+        !self.is_unrestricted()
+            && self.include_cidrs().is_empty()
+            && self.include_domains().is_empty()
     }
 
     pub fn include_cidrs(&self) -> &[IpNet] {
-        &self.include_cidrs
+        match self {
+            Self::Unrestricted {} => &[],
+            Self::Selected(selectors) => &selectors.include_cidrs,
+        }
     }
-
     pub fn include_domains(&self) -> &[String] {
-        &self.include_domains
+        match self {
+            Self::Unrestricted {} => &[],
+            Self::Selected(selectors) => &selectors.include_domains,
+        }
     }
-
-    pub fn uses_virtual_dns(&self) -> bool {
-        self.is_full_tunnel() || !self.include_domains.is_empty()
+    pub fn allows_name_resolution(&self) -> bool {
+        self.is_unrestricted() || !self.include_domains().is_empty()
     }
-
-    pub(super) fn requires_ipv6_tunnel(&self) -> bool {
-        self.uses_virtual_dns()
+    pub(crate) fn allows_ipv6(&self) -> bool {
+        self.allows_name_resolution()
             || self
-                .include_cidrs
+                .include_cidrs()
                 .iter()
                 .any(|network| network.addr().is_ipv6())
     }
-
     pub fn matches_domain(&self, hostname: &str) -> bool {
         let Some(hostname) = normalize_candidate_domain(hostname) else {
             return false;
         };
-        self.include_domains
+        self.include_domains()
             .iter()
             .any(|suffix| domain_matches_suffix(&hostname, suffix))
     }
-
     pub(crate) fn matches_dns_name(&self, name: &DnsName) -> bool {
-        self.include_domains
+        self.include_domains()
             .iter()
             .any(|suffix| name.ends_with_ascii_suffix(suffix))
     }
-
     pub fn contains_ip(&self, address: IpAddr) -> bool {
-        self.include_cidrs
+        self.include_cidrs()
             .iter()
             .any(|network| network.contains(&address))
     }
-
-    pub(super) fn contains_exact_ip(&self, address: IpAddr) -> bool {
-        self.include_cidrs.iter().any(|network| {
+    pub(crate) fn contains_exact_ip(&self, address: IpAddr) -> bool {
+        self.include_cidrs().iter().any(|network| {
             network.prefix_len() == network.max_prefix_len() && network.addr() == address
         })
     }
-}
 
-impl Default for SystemVpnPolicy {
-    fn default() -> Self {
-        Self::full_tunnel()
+    /// Computes the access available through both policies, preserving an empty intersection.
+    pub fn intersection(&self, other: &Self) -> Self {
+        if self.is_unrestricted() {
+            return other.clone();
+        }
+        if other.is_unrestricted() {
+            return self.clone();
+        }
+        let mut cidrs = Vec::new();
+        for left in self.include_cidrs() {
+            for right in other.include_cidrs() {
+                if left.contains(&right.network()) {
+                    cidrs.push(*right);
+                } else if right.contains(&left.network()) {
+                    cidrs.push(*left);
+                }
+            }
+        }
+        let mut domains = Vec::new();
+        for left in self.include_domains() {
+            for right in other.include_domains() {
+                if domain_matches_suffix(left, right) {
+                    domains.push(left.clone());
+                } else if domain_matches_suffix(right, left) {
+                    domains.push(right.clone());
+                }
+            }
+        }
+        Self::selected(cidrs, domains).expect("intersected selectors are normalized")
     }
 }
 
-impl<'de> Deserialize<'de> for SystemVpnPolicy {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let unvalidated = UnvalidatedSystemVpnPolicy::deserialize(deserializer)?;
-        Self::new(unvalidated.include_cidrs, unvalidated.include_domains).map_err(D::Error::custom)
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self::unrestricted()
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkPolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match UnvalidatedNetworkPolicy::deserialize(deserializer)? {
+            UnvalidatedNetworkPolicy::Unrestricted {} => Ok(Self::unrestricted()),
+            UnvalidatedNetworkPolicy::Selected {
+                include_cidrs,
+                include_domains,
+            } => Self::selected(include_cidrs, include_domains).map_err(D::Error::custom),
+        }
     }
 }
 
@@ -158,24 +206,24 @@ fn normalize_domain(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let domain = trimmed.strip_suffix('.').unwrap_or(trimmed);
     if domain.is_empty() {
-        bail!("VPN include domain must not be empty");
+        bail!("network include domain must not be empty");
     }
     if domain.contains('*') {
         bail!(
-            "VPN include domain `{value}` must not contain a wildcard; the apex already includes every subdomain"
+            "network include domain `{value}` must not contain a wildcard; the apex already includes every subdomain"
         );
     }
 
     let canonical = match Host::parse(domain)
-        .with_context(|| format!("invalid VPN include domain `{value}`"))?
+        .with_context(|| format!("invalid network include domain `{value}`"))?
     {
         Host::Domain(domain) => domain,
         Host::Ipv4(_) | Host::Ipv6(_) => {
-            bail!("VPN include domain `{value}` is an IP address; use --vpn-include-cidr")
+            bail!("network include domain `{value}` is an IP address; use --include-cidr")
         }
     };
     validate_dns_name(&canonical)
-        .with_context(|| format!("invalid VPN include domain `{value}`"))?;
+        .with_context(|| format!("invalid network include domain `{value}`"))?;
     Ok(canonical)
 }
 
@@ -223,20 +271,20 @@ fn domain_matches_suffix(hostname: &str, suffix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemVpnPolicy;
-    use crate::vpn::dns::DnsName;
+    use super::NetworkPolicy;
+    use crate::domain::DnsName;
 
     #[test]
-    fn empty_policy_is_full_tunnel() {
-        let policy = SystemVpnPolicy::default();
+    fn empty_policy_is_unrestricted() {
+        let policy = NetworkPolicy::default();
 
-        assert!(policy.is_full_tunnel());
-        assert!(policy.uses_virtual_dns());
+        assert!(policy.is_unrestricted());
+        assert!(policy.allows_name_resolution());
     }
 
     #[test]
     fn cidrs_are_canonicalized_and_redundant_networks_are_removed() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             vec![
                 "10.20.4.7/16".parse().unwrap(),
                 "10.20.8.0/24".parse().unwrap(),
@@ -255,9 +303,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["10.20.0.0/16", "2001:db8:1::/48"]
         );
-        assert!(!policy.is_full_tunnel());
-        assert!(!policy.uses_virtual_dns());
-        assert!(policy.requires_ipv6_tunnel());
+        assert!(!policy.is_unrestricted());
+        assert!(!policy.allows_name_resolution());
+        assert!(policy.allows_ipv6());
         assert!(policy.contains_ip("10.20.255.254".parse().unwrap()));
         assert!(policy.contains_ip("2001:db8:1:ffff::1".parse().unwrap()));
         assert!(!policy.contains_ip("10.21.0.1".parse().unwrap()));
@@ -292,9 +340,9 @@ mod tests {
         }
         input.extend(expected);
         input.reverse();
-        let policy = SystemVpnPolicy::new(input, Vec::new()).unwrap();
+        let policy = NetworkPolicy::new(input, Vec::new()).unwrap();
         assert_eq!(policy.include_cidrs(), expected);
-        let all = SystemVpnPolicy::new(
+        let all = NetworkPolicy::new(
             expected
                 .into_iter()
                 .chain(["0.0.0.1/0".parse().unwrap(), "::1/0".parse().unwrap()])
@@ -309,20 +357,19 @@ mod tests {
                 "::/0".parse().unwrap()
             ]
         );
-        assert!(!all.is_full_tunnel());
+        assert!(!all.is_unrestricted());
     }
 
     #[test]
     fn ipv4_only_cidr_policy_does_not_require_ipv6_interface_state() {
-        let policy =
-            SystemVpnPolicy::new(vec!["192.0.2.0/24".parse().unwrap()], Vec::new()).unwrap();
+        let policy = NetworkPolicy::new(vec!["192.0.2.0/24".parse().unwrap()], Vec::new()).unwrap();
 
-        assert!(!policy.requires_ipv6_tunnel());
+        assert!(!policy.allows_ipv6());
     }
 
     #[test]
     fn domains_are_idna_normalized_and_redundant_suffixes_are_removed() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             Vec::new(),
             vec![
                 "Login.BÜCHER.example.".to_string(),
@@ -340,7 +387,7 @@ mod tests {
 
     #[test]
     fn domain_normalization_preserves_label_boundaries_and_presentation_order() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             Vec::new(),
             [
                 "deep.a.b.example",
@@ -375,7 +422,7 @@ mod tests {
 
     #[test]
     fn domain_selector_matches_the_apex_and_only_label_bounded_subdomains() {
-        let policy = SystemVpnPolicy::new(Vec::new(), vec!["anthem.com".to_string()]).unwrap();
+        let policy = NetworkPolicy::new(Vec::new(), vec!["anthem.com".to_string()]).unwrap();
 
         assert!(policy.matches_domain("anthem.com"));
         assert!(policy.matches_domain("login.care.anthem.com"));
@@ -386,7 +433,7 @@ mod tests {
     #[test]
     fn domain_selector_accepts_arbitrary_query_labels_under_the_suffix() {
         let policy =
-            SystemVpnPolicy::new(Vec::new(), vec!["elevancehealth.com".to_string()]).unwrap();
+            NetworkPolicy::new(Vec::new(), vec!["elevancehealth.com".to_string()]).unwrap();
 
         assert!(policy.matches_domain("_service.jira.elevancehealth.com"));
         assert!(
@@ -420,7 +467,7 @@ mod tests {
             ".",
         ] {
             assert!(
-                SystemVpnPolicy::new(Vec::new(), vec![domain.to_string()]).is_err(),
+                NetworkPolicy::new(Vec::new(), vec![domain.to_string()]).is_err(),
                 "selector unexpectedly accepted: {domain}"
             );
         }
@@ -428,7 +475,7 @@ mod tests {
 
     #[test]
     fn serialized_policy_uses_normalized_cidr_and_domain_lists() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             vec!["10.20.4.7/16".parse().unwrap()],
             vec!["ANTHEM.COM".to_string()],
         )
@@ -444,17 +491,57 @@ mod tests {
             serde_json::json!(["anthem.com"])
         );
 
-        let decoded: SystemVpnPolicy = serde_json::from_value(encoded).unwrap();
+        let decoded: NetworkPolicy = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, policy);
     }
 
     #[test]
     fn deserialization_enforces_domain_validation() {
-        let result = serde_json::from_value::<SystemVpnPolicy>(serde_json::json!({
+        let result = serde_json::from_value::<NetworkPolicy>(serde_json::json!({
+            "kind": "selected",
             "include_cidrs": [],
             "include_domains": ["*.example.com"]
         }));
 
         assert!(result.is_err());
+    }
+    #[test]
+    fn intersection_narrows_cidrs_and_domain_suffixes() {
+        let first = NetworkPolicy::new(
+            vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap(),
+            ],
+            vec!["example.com".to_string()],
+        )
+        .unwrap();
+        let second = NetworkPolicy::new(
+            vec![
+                "10.20.0.0/16".parse().unwrap(),
+                "2001:db8:20::/48".parse().unwrap(),
+            ],
+            vec!["api.example.com".to_string()],
+        )
+        .unwrap();
+        let intersection = first.intersection(&second);
+        assert_eq!(intersection, second);
+        assert_eq!(intersection, second.intersection(&first));
+        assert_eq!(
+            intersection,
+            NetworkPolicy::unrestricted().intersection(&second)
+        );
+    }
+
+    #[test]
+    fn empty_intersections_remain_denied_when_serialized() {
+        let first = NetworkPolicy::new(vec!["10.0.0.0/8".parse().unwrap()], Vec::new()).unwrap();
+        let second = NetworkPolicy::new(vec!["192.0.2.0/24".parse().unwrap()], Vec::new()).unwrap();
+        let denied = first.intersection(&second);
+        assert!(denied.is_empty());
+        assert!(!denied.is_unrestricted());
+        let decoded: NetworkPolicy =
+            serde_json::from_value(serde_json::to_value(&denied).unwrap()).unwrap();
+        assert_eq!(decoded, denied);
+        assert!(decoded.is_empty());
     }
 }

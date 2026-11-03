@@ -21,7 +21,7 @@ pub(super) const MAX_RESOLVED_ADDRESSES: usize = 16;
 pub(crate) const MAX_CONCURRENT_NATIVE_RESOLVER_LOOKUPS: usize = 64;
 const MAX_CONCURRENT_NATIVE_EGRESS_LOOKUPS: usize = 64;
 
-pub(crate) struct ClientResolver {
+pub(crate) struct NativeResolver {
     native_resolver_lookups: Arc<Semaphore>,
     native_egress_lookups: Arc<Semaphore>,
 }
@@ -44,7 +44,7 @@ enum NativeLookupClass {
     Egress,
 }
 
-impl ClientResolver {
+impl NativeResolver {
     pub(crate) fn from_system_configuration() -> Self {
         Self {
             native_resolver_lookups: Arc::new(Semaphore::new(
@@ -105,7 +105,7 @@ impl ClientResolver {
         {
             Ok(result) => result,
             Err(NativeLookupAdmissionError::Saturated) => Err(NetworkError::resource_limit(
-                "client native resolver concurrency limit reached",
+                "provider native resolver concurrency limit reached",
             )),
             Err(NativeLookupAdmissionError::TaskFailed(error)) => Err(NetworkError::new(
                 NetworkErrorKind::General,
@@ -318,9 +318,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        ClientResolver, DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_CNAME, DNS_TYPE_HTTPS, DNS_TYPE_SVCB,
+        DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_CNAME, DNS_TYPE_HTTPS, DNS_TYPE_SVCB,
         MAX_RESOLVED_ADDRESSES, NativeLookupAdmissionError, NativeLookupClass, NativeLookupOutcome,
-        fully_qualified_name, interleave_address_families, lookup_address_family,
+        NativeResolver, fully_qualified_name, interleave_address_families, lookup_address_family,
         select_socket_addresses, socket_address_hints,
     };
     use crate::network::protocol::ResolutionFamily;
@@ -359,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn literal_targets_bypass_native_resolution_unchanged() {
-        let resolver = ClientResolver::with_native_lookup_limits(0, 0);
+        let resolver = NativeResolver::with_native_lookup_limits(0, 0);
         for expected in [
             "192.0.2.8:443".parse::<SocketAddr>().unwrap(),
             "[2001:db8::8]:443".parse::<SocketAddr>().unwrap(),
@@ -451,7 +451,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborting_a_waiter_does_not_release_a_running_native_lookup() {
-        let resolver = Arc::new(ClientResolver::with_native_lookup_limits(1, 1));
+        let resolver = Arc::new(NativeResolver::with_native_lookup_limits(1, 1));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = oneshot::channel();
         let lookup_task = tokio::spawn({
@@ -502,7 +502,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn saturated_egress_lookups_do_not_consume_resolver_admission() {
-        let resolver = Arc::new(ClientResolver::with_native_lookup_limits(1, 1));
+        let resolver = Arc::new(NativeResolver::with_native_lookup_limits(1, 1));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = oneshot::channel();
         let egress_task = tokio::spawn({
@@ -544,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_address_queries_reach_the_native_resolver() {
-        let resolver = ClientResolver::from_system_configuration();
+        let resolver = NativeResolver::from_system_configuration();
         for record_type in [DNS_TYPE_CNAME, DNS_TYPE_SVCB, DNS_TYPE_HTTPS] {
             assert_eq!(
                 resolver.resolve(&request(record_type, 1)).await,
@@ -563,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_positive_results_reveal_only_a_bounded_ttl() {
-        let resolver = ClientResolver::from_system_configuration();
+        let resolver = NativeResolver::from_system_configuration();
         let outcome = resolver.resolve(&request(DNS_TYPE_A, 1)).await;
 
         assert_eq!(outcome, ResolveOutcome::Positive { answer_ttl: 30 });

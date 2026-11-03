@@ -31,7 +31,7 @@ from types import FrameType
 
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
-RECOVERY_JOURNAL: Path = Path("/var/run/sshportal/network-state.jsonl")
+RECOVERY_JOURNAL: Path = Path("/var/run/bifrost/network-state.jsonl")
 TEST_DOMAIN: str = "localhost"
 TEST_CIDR: str = "2001:db8:ffff::/48"
 TEST_CIDR_ADDRESS: str = "2001:db8:ffff::1"
@@ -44,7 +44,7 @@ DNS_TIMEOUT_SECONDS: float = 15.0
 PROCESS_TIMEOUT_SECONDS: float = 30.0
 BUILD_TIMEOUT_SECONDS: float = 600.0
 READ_CHUNK_BYTES: int = 4096
-ECHO_PREFIX: bytes = b"sshportal-native-echo:"
+ECHO_PREFIX: bytes = b"bifrost-native-echo:"
 
 
 @dataclass
@@ -207,7 +207,7 @@ class TlsForwarder:
         self._connections = set()
         self._thread = threading.Thread(
             target=self._run,
-            name="sshportal-macos-vpn-tls",
+            name="bifrost-macos-vpn-tls",
             daemon=True,
         )
 
@@ -355,7 +355,7 @@ class TlsForwarder:
 
 
 class EchoServices:
-    """Provide deterministic IPv4 and IPv6 TCP and UDP client-side endpoints."""
+    """Provide deterministic IPv4 and IPv6 TCP and UDP provider endpoints."""
 
     tcp_ports: dict[int, int]
     udp_ports: dict[int, int]
@@ -421,7 +421,7 @@ class EchoServices:
         thread = threading.Thread(
             target=target,
             args=(bound,),
-            name=f"sshportal-macos-vpn-{label}",
+            name=f"bifrost-macos-vpn-{label}",
             daemon=True,
         )
         thread.start()
@@ -693,7 +693,7 @@ def generate_tls_material(directory: Path) -> tuple[Path, Path, Path]:
             "-days",
             "1",
             "-subj",
-            "/CN=SSHPortal macOS VPN E2E Ephemeral Root",
+            "/CN=Bifrost macOS VPN E2E Ephemeral Root",
             "-addext",
             "basicConstraints=critical,CA:TRUE",
             "-addext",
@@ -743,16 +743,16 @@ def generate_tls_material(directory: Path) -> tuple[Path, Path, Path]:
 
 
 def vpn_dns_keys() -> set[str]:
-    """Return SSHPortal DNS keys currently present in SystemConfiguration.
+    """Return Bifrost DNS keys currently present in SystemConfiguration.
 
-    :returns: Dynamic-store keys owned by SSHPortal sessions.
+    :returns: Dynamic-store keys owned by Bifrost sessions.
     """
 
     output = command_output(
         ["scutil"],
-        input_text="list State:/Network/Service/SSHPortal-.*/DNS\nquit\n",
+        input_text="list State:/Network/Service/Bifrost-.*/DNS\nquit\n",
     )
-    return set(re.findall(r"State:/Network/Service/SSHPortal-[0-9a-f]{32}/DNS", output))
+    return set(re.findall(r"State:/Network/Service/Bifrost-[0-9a-f]{32}/DNS", output))
 
 
 def dynamic_store_value(key: str) -> str:
@@ -788,7 +788,7 @@ def scutil_array(dictionary: str, field: str) -> list[str]:
 
 
 def wait_for_dns_key(baseline: set[str], timeout_seconds: float) -> str:
-    """Wait for exactly one new SSHPortal DNS key.
+    """Wait for exactly one new Bifrost DNS key.
 
     :param baseline: Keys present before the session.
     :param timeout_seconds: Maximum time to wait.
@@ -807,7 +807,7 @@ def wait_for_dns_key(baseline: set[str], timeout_seconds: float) -> str:
             break
         time.sleep(0.1)
     raise RuntimeError(
-        "expected exactly one new SSHPortal DNS key, "
+        "expected exactly one new Bifrost DNS key, "
         f"baseline={sorted(baseline)}, observed={sorted(observed)}"
     )
 
@@ -1064,7 +1064,7 @@ def verify_tcp_tunnel(
     """Verify bidirectional TCP and half-close propagation through the tunnel.
 
     :param address: Synthetic destination address.
-    :param port: Matching client-side echo port.
+    :param port: Matching provider echo port.
     """
 
     payload = b"tcp-" + os.urandom(32)
@@ -1089,7 +1089,7 @@ def verify_udp_tunnel(
     """Verify one bidirectional UDP datagram through the tunnel.
 
     :param address: Synthetic destination address.
-    :param port: Matching client-side echo port.
+    :param port: Matching provider echo port.
     """
 
     family = socket.AF_INET if isinstance(address, ipaddress.IPv4Address) else socket.AF_INET6
@@ -1126,8 +1126,8 @@ def client_environment() -> dict[str, str]:
 
 
 def start_session(
-    server_binary: Path,
-    client_binary: Path,
+    binary: Path,
+    provider_connects: bool,
     root_certificate: Path,
     server_certificate: Path,
     server_key: Path,
@@ -1136,8 +1136,8 @@ def start_session(
 ) -> tuple[SpawnedProcess, SpawnedProcess, TlsForwarder]:
     """Start one root server, local WSS proxy, and unprivileged client.
 
-    :param server_binary: Built server executable.
-    :param client_binary: Built client executable.
+    :param binary: Built Bifrost executable.
+    :param provider_connects: Whether the provider initiates the rendezvous connection.
     :param root_certificate: PEM root trusted only by the fixture client.
     :param server_certificate: PEM certificate for the local WSS listener.
     :param server_key: PEM private key for the local WSS listener.
@@ -1147,46 +1147,34 @@ def start_session(
     """
 
     backend_port = choose_loopback_port()
-    server = spawn_process(
-        "macOS VPN server",
-        [
-            "sudo",
-            "-n",
-            str(server_binary),
-            "--listen",
-            f"127.0.0.1:{backend_port}",
-            "--operator-name",
-            "macos-vpn-e2e",
-            "--join-token",
-            JOIN_TOKEN,
-            "--vpn",
-            *policy_arguments,
-            *connection_arguments,
-        ],
-    )
+    forwarder = TlsForwarder(server_certificate, server_key, backend_port)
+    listen_arguments: list[str] = ["--listen", f"127.0.0.1:{backend_port}", "--join-token", JOIN_TOKEN]
     client: SpawnedProcess | None = None
-    forwarder = TlsForwarder(
-        server_certificate,
-        server_key,
-        backend_port,
-    )
+    server: SpawnedProcess | None = None
     try:
-        server.wait_for_text("sshportal server listening", PROCESS_TIMEOUT_SECONDS)
         forwarder.start()
-        client = spawn_process(
-            "macOS VPN client",
-            [
-                str(client_binary),
-                "--server",
-                f"https://localhost:{forwarder.port}/connect?token={JOIN_TOKEN}",
-                "--tls-ca-certificate",
-                str(root_certificate),
-                "--approve-session",
-                *connection_arguments,
-            ],
-            env=client_environment(),
-        )
-        client.wait_for_text("VPN egress session approved", PROCESS_TIMEOUT_SECONDS)
+        connect_arguments: list[str] = [
+            "--connect", f"https://localhost:{forwarder.port}/connect?token={JOIN_TOKEN}",
+            "--tls-ca-certificate", str(root_certificate),
+        ]
+        consumer_command: list[str] = [
+            "sudo", "-n", str(binary), "access",
+            *(listen_arguments if provider_connects else connect_arguments),
+            "--consumer-name", "macos-vpn-e2e", "--vpn", *policy_arguments, *connection_arguments,
+        ]
+        provider_command: list[str] = [
+            str(binary), "provide", *(connect_arguments if provider_connects else listen_arguments),
+            "--approve-session", *connection_arguments,
+        ]
+        if provider_connects:
+            server = spawn_process("macOS VPN consumer", consumer_command)
+            server.wait_for_text("Bifrost listening", PROCESS_TIMEOUT_SECONDS)
+            client = spawn_process("macOS network provider", provider_command, env=client_environment())
+        else:
+            client = spawn_process("macOS network provider", provider_command, env=client_environment())
+            client.wait_for_text("Bifrost listening", PROCESS_TIMEOUT_SECONDS)
+            server = spawn_process("macOS VPN consumer", consumer_command)
+        client.wait_for_text("network access approved", PROCESS_TIMEOUT_SECONDS)
         server.wait_for_text("VPN active on interface", PROCESS_TIMEOUT_SECONDS)
         return server, client, forwarder
     except (KeyboardInterrupt, OSError, RuntimeError):
@@ -1195,13 +1183,14 @@ def start_session(
                 client.terminate()
         finally:
             try:
-                server.signal_group(signal.SIGINT)
-                try:
-                    server.wait(10.0)
-                except RuntimeError:
-                    server.terminate()
-                else:
-                    server.close()
+                if server is not None:
+                    server.signal_group(signal.SIGINT)
+                    try:
+                        server.wait(10.0)
+                    except RuntimeError:
+                        server.terminate()
+                    else:
+                        server.close()
             finally:
                 forwarder.stop()
         raise
@@ -1299,16 +1288,19 @@ def verify_supplemental_dns(
     return key, servers
 
 
-def graceful_shutdown(server: SpawnedProcess, client: SpawnedProcess) -> None:
+def graceful_shutdown(server: SpawnedProcess, client: SpawnedProcess, provider_connects: bool) -> None:
     """Interrupt the server through its real PID and require clean exits.
 
     :param server: Active privileged server process.
-    :param client: Active unprivileged client process.
+    :param client: Active unprivileged provider process.
+    :param provider_connects: Whether the provider is a single dialing session or a persistent listener.
     """
 
     owner_pid = journal_owner_pid()
     run_checked(["sudo", "-n", "kill", "-INT", str(owner_pid)])
     server_exit = server.wait(PROCESS_TIMEOUT_SECONDS)
+    if provider_connects is False:
+        client.signal_group(signal.SIGINT)
     client_exit = client.wait(PROCESS_TIMEOUT_SECONDS)
     if server_exit != 0 or client_exit != 0:
         raise RuntimeError(
@@ -1325,7 +1317,8 @@ def transport_failure_shutdown(server: SpawnedProcess, client: SpawnedProcess) -
     :param client: Active unprivileged client process.
     """
 
-    client.signal_group(signal.SIGTERM)
+    # SIGKILL exercises transport loss without an orderly protocol shutdown.
+    client.signal_group(signal.SIGKILL)
     client.wait(10.0)
     server_exit = server.wait(PROCESS_TIMEOUT_SECONDS)
     if server_exit == 0:
@@ -1426,8 +1419,8 @@ def cleanup_processes(
 
 
 def run_domain_session(
-    server_binary: Path,
-    client_binary: Path,
+    binary: Path,
+    provider_connects: bool,
     root_certificate: Path,
     server_certificate: Path,
     server_key: Path,
@@ -1436,8 +1429,8 @@ def run_domain_session(
 ) -> None:
     """Exercise native DNS, dual-stack TUN, TCP, UDP, and graceful cleanup.
 
-    :param server_binary: Built server executable.
-    :param client_binary: Built client executable.
+    :param binary: Built Bifrost executable.
+    :param provider_connects: Whether the provider initiates the rendezvous connection.
     :param root_certificate: PEM root trusted only by the fixture client.
     :param server_certificate: PEM certificate for the local WSS listener.
     :param server_key: PEM private key for the local WSS listener.
@@ -1448,12 +1441,12 @@ def run_domain_session(
     baseline_dns = vpn_dns_keys()
     baseline_interfaces = current_interfaces()
     server, client, forwarder = start_session(
-        server_binary,
-        client_binary,
+        binary,
+        provider_connects,
         root_certificate,
         server_certificate,
         server_key,
-        ["--vpn-include-domain", TEST_DOMAIN],
+        ["--include-domain", TEST_DOMAIN],
         [],
     )
     routed_addresses: list[str] = []
@@ -1479,7 +1472,7 @@ def run_domain_session(
         verify_udp_tunnel(ipv4, echoes.udp_ports[socket.AF_INET])
         verify_udp_tunnel(ipv6, echoes.udp_ports[socket.AF_INET6])
         echoes.assert_healthy()
-        graceful_shutdown(server, client)
+        graceful_shutdown(server, client, provider_connects)
         wait_for_cleanup(
             baseline_dns,
             interface,
@@ -1498,8 +1491,8 @@ def run_domain_session(
 
 
 def run_reconnect_domain_session(
-    server_binary: Path,
-    client_binary: Path,
+    binary: Path,
+    provider_connects: bool,
     root_certificate: Path,
     server_certificate: Path,
     server_key: Path,
@@ -1508,8 +1501,8 @@ def run_reconnect_domain_session(
 ) -> None:
     """Recover a native VPN epoch and reuse cached synthetic DNS addresses.
 
-    :param server_binary: Built server executable.
-    :param client_binary: Built client executable.
+    :param binary: Built Bifrost executable.
+    :param provider_connects: Whether the provider initiates the rendezvous connection.
     :param root_certificate: PEM root trusted only by the fixture client.
     :param server_certificate: PEM certificate for the local WSS listener.
     :param server_key: PEM private key for the local WSS listener.
@@ -1519,12 +1512,12 @@ def run_reconnect_domain_session(
 
     baseline_dns = vpn_dns_keys()
     server, client, forwarder = start_session(
-        server_binary,
-        client_binary,
+        binary,
+        provider_connects,
         root_certificate,
         server_certificate,
         server_key,
-        ["--vpn-include-domain", TEST_DOMAIN],
+        ["--include-domain", TEST_DOMAIN],
         [
             "--reconnect",
             "--reconnect-interval-seconds",
@@ -1546,9 +1539,9 @@ def run_reconnect_domain_session(
         verify_tcp_tunnel(ipv4, echoes.tcp_ports[socket.AF_INET])
         verify_tcp_tunnel(ipv6, echoes.tcp_ports[socket.AF_INET6])
         forwarder.disconnect()
-        server.wait_for_text("for the approved client to reconnect", PROCESS_TIMEOUT_SECONDS)
+        server.wait_for_text("for the approved peer to reconnect", PROCESS_TIMEOUT_SECONDS)
         server.wait_for_text("VPN active on interface", PROCESS_TIMEOUT_SECONDS, 2)
-        client.wait_for_text("VPN egress session approved", PROCESS_TIMEOUT_SECONDS, 2)
+        client.wait_for_text("network access approved", PROCESS_TIMEOUT_SECONDS, 2)
         interface = active_interface(server)
         verify_interface_configuration(interface)
         if route_path("1.1.1.1") != baseline_route:
@@ -1588,8 +1581,8 @@ def run_reconnect_domain_session(
 
 
 def run_cidr_failure_session(
-    server_binary: Path,
-    client_binary: Path,
+    binary: Path,
+    provider_connects: bool,
     root_certificate: Path,
     server_certificate: Path,
     server_key: Path,
@@ -1597,8 +1590,8 @@ def run_cidr_failure_session(
 ) -> None:
     """Exercise DNS-free readiness and cleanup after transport failure.
 
-    :param server_binary: Built server executable.
-    :param client_binary: Built client executable.
+    :param binary: Built Bifrost executable.
+    :param provider_connects: Whether the provider initiates the rendezvous connection.
     :param root_certificate: PEM root trusted only by the fixture client.
     :param server_certificate: PEM certificate for the local WSS listener.
     :param server_key: PEM private key for the local WSS listener.
@@ -1608,12 +1601,12 @@ def run_cidr_failure_session(
     baseline_dns = vpn_dns_keys()
     baseline_interfaces = current_interfaces()
     server, client, forwarder = start_session(
-        server_binary,
-        client_binary,
+        binary,
+        provider_connects,
         root_certificate,
         server_certificate,
         server_key,
-        ["--vpn-include-cidr", TEST_CIDR],
+        ["--include-cidr", TEST_CIDR],
         [],
     )
     try:
@@ -1664,16 +1657,16 @@ def preflight() -> None:
         )
     dns = vpn_dns_keys()
     if len(dns) > 0:
-        raise RuntimeError(f"another SSHPortal VPN DNS session is active: {sorted(dns)}")
+        raise RuntimeError(f"another Bifrost VPN DNS session is active: {sorted(dns)}")
     processes = command_output(["ps", "ax", "-o", "command="])
     active_servers = [
         line
         for line in processes.splitlines()
-        if "sshportal-server" in line and re.search(r"(?:^|\s)--vpn(?:\s|$)", line) is not None
+        if "bifrost" in line and " access " in line and re.search(r"(?:^|\s)--vpn(?:\s|$)", line) is not None
     ]
     if len(active_servers) > 0:
         raise RuntimeError(
-            "another SSHPortal system VPN server is active:\n" + "\n".join(active_servers)
+            "another Bifrost system VPN server is active:\n" + "\n".join(active_servers)
         )
 
 
@@ -1689,6 +1682,7 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="reuse target/release binaries instead of rebuilding them",
     )
+    parser.add_argument("--dialer", choices=["provider", "consumer"], default="provider", help="peer that opens the production WebSocket connection")
     return parser.parse_args()
 
 
@@ -1716,22 +1710,20 @@ def main() -> int:
             ["cargo", "build", "--locked", "--release", "--bins"],
             timeout_seconds=BUILD_TIMEOUT_SECONDS,
         )
-    server_binary = PROJECT_ROOT / "target/release/sshportal-server"
-    client_binary = PROJECT_ROOT / "target/release/sshportal-client"
-    for binary in [server_binary, client_binary]:
-        if not binary.is_file():
-            raise RuntimeError(f"required release binary is missing: {binary}")
+    binary: Path = PROJECT_ROOT / "target/release/bifrost"
+    if not binary.is_file():
+        raise RuntimeError(f"required release binary is missing: {binary}")
 
     signal.signal(signal.SIGTERM, handle_termination)
     baseline_route = route_path("1.1.1.1")
-    with tempfile.TemporaryDirectory(prefix="sshportal-macos-vpn-e2e-") as raw_directory:
+    with tempfile.TemporaryDirectory(prefix="bifrost-macos-vpn-e2e-") as raw_directory:
         directory = Path(raw_directory)
         root_certificate, server_certificate, server_key = generate_tls_material(directory)
         echoes = EchoServices()
         try:
             run_domain_session(
-                server_binary,
-                client_binary,
+                binary,
+                arguments.dialer == "provider",
                 root_certificate,
                 server_certificate,
                 server_key,
@@ -1739,16 +1731,16 @@ def main() -> int:
                 baseline_route,
             )
             run_cidr_failure_session(
-                server_binary,
-                client_binary,
+                binary,
+                arguments.dialer == "provider",
                 root_certificate,
                 server_certificate,
                 server_key,
                 baseline_route,
             )
             run_reconnect_domain_session(
-                server_binary,
-                client_binary,
+                binary,
+                arguments.dialer == "provider",
                 root_certificate,
                 server_certificate,
                 server_key,

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::name::{DnsName, DnsNameBuilder, NameError};
+use crate::domain::{DnsName, DnsNameBuilder, NameError};
 
 const DNS_HEADER_LENGTH: usize = 12;
 const MAX_DNS_MESSAGE_LENGTH: usize = u16::MAX as usize;

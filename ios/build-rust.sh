@@ -25,8 +25,8 @@ for architecture in $architectures; do
         iphonesimulator:x86_64) rust_target=x86_64-apple-ios ;;
         *) echo "Unsupported Apple platform and architecture: $PLATFORM_NAME:$architecture" >&2; exit 1 ;;
     esac
-    cargo build --locked -p sshportal-ios --target "$rust_target" --profile "$cargo_profile"
-    libraries+=("$CARGO_TARGET_DIR/$rust_target/$profile/libsshportal_ios.a")
+    cargo build --locked -p bifrost-ios --target "$rust_target" --profile "$cargo_profile"
+    libraries+=("$CARGO_TARGET_DIR/$rust_target/$profile/libbifrost_ios.a")
 done
 mkdir -p "$BUILT_PRODUCTS_DIR/rust"
-xcrun lipo -create "${libraries[@]}" -output "$BUILT_PRODUCTS_DIR/rust/libsshportal_ios.a"
+xcrun lipo -create "${libraries[@]}" -output "$BUILT_PRODUCTS_DIR/rust/libbifrost_ios.a"

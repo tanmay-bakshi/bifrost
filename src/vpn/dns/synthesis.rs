@@ -2,11 +2,11 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::mapping::SyntheticAddressMap;
-use super::name::DnsName;
 use super::protocol::{
     DnsQuery, RecordClass, RecordType, ResponseCode, TcpFrameError, frame_tcp_message, write_u16,
     write_u32,
 };
+use crate::domain::DnsName;
 
 const DNS_HEADER_LENGTH: usize = 12;
 const DNS_UDP_MINIMUM_PAYLOAD: usize = 512;
@@ -311,11 +311,11 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::super::mapping::{Ipv4Pool, Ipv6Pool, SyntheticAddressMap};
-    use super::super::name::DnsName;
     use super::super::protocol::{
         DnsQuery, RecordType, ResponseCode, parse_name, unframe_tcp_message,
     };
     use super::{Answer, DnsResponse, Resolution, SynthesisError, synthesize_response};
+    use crate::domain::DnsName;
 
     struct ParsedAnswer {
         owner: DnsName,

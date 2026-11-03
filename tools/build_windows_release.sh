@@ -188,14 +188,11 @@ cargo "+$rust_toolchain" xwin build \
     --bins
 
 release_directory="$repository_root/target/$target/release"
-client_binary="$release_directory/sshportal-client.exe"
-server_binary="$release_directory/sshportal-server.exe"
+bifrost_binary="$release_directory/bifrost.exe"
 
-[[ -f "$client_binary" ]] || fail "build did not produce $client_binary"
-[[ -f "$server_binary" ]] || fail "build did not produce $server_binary"
+[[ -f "$bifrost_binary" ]] || fail "build did not produce $bifrost_binary"
 
-verify_imports "$client_binary"
-verify_imports "$server_binary"
+verify_imports "$bifrost_binary"
 
 metadata="$(
     cargo "+$rust_toolchain" metadata \
@@ -206,8 +203,8 @@ metadata="$(
 
 package_version="$(
     jq -er '
-        [.packages[] | select(.name == "sshportal")] |
-        if length == 1 then .[0].version else error("expected one sshportal package") end
+        [.packages[] | select(.name == "bifrost")] |
+        if length == 1 then .[0].version else error("expected one bifrost package") end
     ' <<< "$metadata"
 )"
 wintun_manifest="$(
@@ -232,9 +229,9 @@ fi
     grep -Fq 'Machine: IMAGE_FILE_MACHINE_AMD64' ||
     fail "$wintun_binary is not an x86-64 PE DLL"
 
-archive_stem="sshportal-v$package_version-$target"
+archive_stem="bifrost-v$package_version-$target"
 dist_directory="$repository_root/dist"
-staging_root="$(mktemp -d -t sshportal-windows-release)"
+staging_root="$(mktemp -d -t bifrost-windows-release)"
 package_directory="$staging_root/$archive_stem"
 temporary_archive="$staging_root/$archive_stem.zip"
 archive_path="$dist_directory/$archive_stem.zip"
@@ -246,8 +243,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$package_directory" "$dist_directory"
-install -m 0755 "$client_binary" "$package_directory/sshportal-client.exe"
-install -m 0755 "$server_binary" "$package_directory/sshportal-server.exe"
+install -m 0755 "$bifrost_binary" "$package_directory/bifrost.exe"
 install -m 0644 "$wintun_binary" "$package_directory/wintun.dll"
 install -m 0644 "$repository_root/README.md" "$package_directory/README.md"
 install -m 0644 "$repository_root/LICENSE" "$package_directory/LICENSE"

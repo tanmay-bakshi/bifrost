@@ -12,13 +12,13 @@ use crate::MAX_NETWORK_UDP_DATAGRAM_BYTES;
 const UDP_DATAGRAM_CAPSULE: u64 = 0;
 const UDP_ERROR_CAPSULE: u64 = 0x3f00;
 
-const ERROR_CODE_HEADER: &str = "sshportal-error-code";
-const ERROR_MESSAGE_HEADER: &str = "sshportal-error-message";
+const ERROR_CODE_HEADER: &str = "bifrost-error-code";
+const ERROR_MESSAGE_HEADER: &str = "bifrost-error-message";
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const UDP_URI_PREFIX: &str = "/.well-known/masque/udp/";
-const NETWORK_AUTHORITY: &str = "network.sshportal.invalid";
-const RESOLUTION_FAMILY_HEADER: &str = "sshportal-resolution-family";
-const UDP_PEER_HEADER: &str = "sshportal-udp-peer";
+const NETWORK_AUTHORITY: &str = "network.bifrost.invalid";
+const RESOLUTION_FAMILY_HEADER: &str = "bifrost-resolution-family";
+const UDP_PEER_HEADER: &str = "bifrost-udp-peer";
 pub(crate) const MAX_UDP_CAPSULE_BYTES: usize = 8 + 8 + 1 + MAX_NETWORK_UDP_DATAGRAM_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -852,7 +852,7 @@ mod tests {
         assert!(NetworkTarget::from_connect_uri(&tcp_uri, &headers).is_err());
 
         let udp_uri =
-            "https://network.sshportal.invalid/.well-known/masque/udp/service%2Eexample/443/"
+            "https://network.bifrost.invalid/.well-known/masque/udp/service%2Eexample/443/"
                 .parse()
                 .unwrap();
         assert!(NetworkTarget::from_connect_udp_uri(&udp_uri, &headers).is_err());

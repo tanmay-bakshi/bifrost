@@ -87,13 +87,13 @@ fn print_ssh_proxy_usage(listen_addr: SocketAddr, username: &str) {
 }
 
 /// Owns stable local listeners and their host key across approved transport epochs.
-pub struct OperatorSsh {
+pub struct ConsumerSsh {
     listener: Arc<TcpListener>,
     dynamic: Option<Arc<TcpListener>>,
     host_key: Arc<PrivateKey>,
 }
 
-impl OperatorSsh {
+impl ConsumerSsh {
     pub async fn bind(ssh_listen: SocketAddr, dynamic_listen: Option<SocketAddr>) -> Result<Self> {
         let listener = Arc::new(
             TcpListener::bind(ssh_listen)
@@ -169,10 +169,10 @@ mod tests {
     use super::connect_authenticated_client_transport;
 
     #[tokio::test]
-    async fn rsa_operator_keys_authenticate_over_the_production_ssh_transport() {
+    async fn rsa_consumer_keys_authenticate_over_the_production_ssh_transport() {
         tokio::time::timeout(Duration::from_secs(15), async {
             let key = Arc::new(
-                PrivateKey::from_openssh(include_str!("../../tests/fixtures/rsa_operator_key"))
+                PrivateKey::from_openssh(include_str!("../../tests/fixtures/rsa_consumer_key"))
                     .unwrap(),
             );
             assert!(matches!(

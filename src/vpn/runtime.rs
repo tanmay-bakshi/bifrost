@@ -14,7 +14,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::NETWORK_SESSION_FLOW_LIMIT;
 use crate::debug::debug_log;
 use crate::network::{
-    NetworkError, NetworkErrorKind, NetworkTarget, OperatorNetworkSession, ResolutionFamily,
+    ConsumerNetworkSession, NetworkError, NetworkErrorKind, NetworkTarget, ResolutionFamily,
     ResolveOutcome, ResolveRequest, TcpReceiveCredit, TcpTunnelReceiver, TcpTunnelSender,
     UdpReceiveCredit, UdpTunnelReceiver, UdpTunnelSender,
 };
@@ -29,7 +29,7 @@ use super::packet::{
     PacketEngineAddresses, PacketEngineError, PacketEngineLimits, PacketTransport,
     PendingPacketCommand, TcpOpenRequest, TcpResetReason, TransportSendError, UdpOpenRequest,
 };
-use super::policy::SystemVpnPolicy;
+use crate::NetworkPolicy;
 
 const FLOW_OUTPUT_MESSAGES: usize = 32;
 const OPEN_REQUESTS: usize = NETWORK_SESSION_FLOW_LIMIT;
@@ -50,9 +50,9 @@ impl VpnRuntime {
     pub(super) fn start<R, W>(
         reader: R,
         writer: W,
-        session: OperatorNetworkSession,
+        session: ConsumerNetworkSession,
         network: VpnNetworkConfiguration,
-        policy: SystemVpnPolicy,
+        policy: NetworkPolicy,
         mappings: Arc<Mutex<SyntheticAddressMap>>,
     ) -> Self
     where
@@ -413,9 +413,9 @@ struct SessionPacketTransport {
 
 impl SessionPacketTransport {
     fn new(
-        session: OperatorNetworkSession,
+        session: ConsumerNetworkSession,
         network: VpnNetworkConfiguration,
-        policy: SystemVpnPolicy,
+        policy: NetworkPolicy,
         mappings: Arc<Mutex<SyntheticAddressMap>>,
     ) -> Self {
         let synthetic = network.synthetic;
@@ -1291,8 +1291,8 @@ where
 }
 
 async fn run_open_dispatcher(
-    session: OperatorNetworkSession,
-    policy: SystemVpnPolicy,
+    session: ConsumerNetworkSession,
+    policy: NetworkPolicy,
     mut requests: mpsc::Receiver<OpenRequest>,
     events: RuntimeEventSenders,
 ) -> Result<()> {
@@ -1373,7 +1373,7 @@ async fn run_health_udp_flow(
 }
 
 async fn run_network_tcp_flow(
-    session: OperatorNetworkSession,
+    session: ConsumerNetworkSession,
     request: TcpOpenRequest,
     target: Result<NetworkTarget, NetworkError>,
     output: FlowOutputStream<TcpOutput>,
@@ -1554,7 +1554,7 @@ async fn write_network_tcp(
 }
 
 async fn run_network_udp_flow(
-    session: OperatorNetworkSession,
+    session: ConsumerNetworkSession,
     request: UdpOpenRequest,
     target: Result<NetworkTarget, NetworkError>,
     output: FlowOutputStream<UdpOutput>,
@@ -1731,8 +1731,8 @@ async fn send_data_event(events: &RuntimeEventSenders, event: DataRuntimeEvent) 
 }
 
 async fn run_dns_udp_flow(
-    session: OperatorNetworkSession,
-    policy: SystemVpnPolicy,
+    session: ConsumerNetworkSession,
+    policy: NetworkPolicy,
     request: UdpOpenRequest,
     mut output: FlowOutputStream<UdpOutput>,
     events: RuntimeEventSenders,
@@ -1798,8 +1798,8 @@ async fn run_dns_udp_flow(
 }
 
 async fn run_dns_tcp_flow(
-    session: OperatorNetworkSession,
-    policy: SystemVpnPolicy,
+    session: ConsumerNetworkSession,
+    policy: NetworkPolicy,
     request: TcpOpenRequest,
     mut output: FlowOutputStream<TcpOutput>,
     events: RuntimeEventSenders,
@@ -1930,7 +1930,7 @@ fn take_dns_tcp_frame(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
 }
 
 async fn resolve_dns_query(
-    session: OperatorNetworkSession,
+    session: ConsumerNetworkSession,
     flow_id: FlowId,
     query: DnsQuery,
     transport: DnsTransport,
@@ -1983,8 +1983,8 @@ async fn emit_dns_failure(
     .await
 }
 
-fn dns_query_allowed(policy: &SystemVpnPolicy, query: &DnsQuery) -> bool {
-    policy.is_full_tunnel() || policy.matches_dns_name(query.question().name())
+fn dns_query_allowed(policy: &NetworkPolicy, query: &DnsQuery) -> bool {
+    policy.is_unrestricted() || policy.matches_dns_name(query.question().name())
 }
 
 async fn emit_dns_refused(
@@ -2034,17 +2034,19 @@ mod tests {
     use super::{
         BufferedBytes, CreditEntry, DataRuntimeEvent, DnsQuery, DnsTransport, FLOW_OUTPUT_MESSAGES,
         FlowOutputEvent, FlowOutputHandle, LifecycleRuntimeEvent, NetworkError, NetworkErrorKind,
-        PacketCommand, ReceiveCredit, Resolution, ResolutionFamily, ResolveOutcome,
+        NetworkPolicy, PacketCommand, ReceiveCredit, Resolution, ResolutionFamily, ResolveOutcome,
         RuntimeEventSenders, SessionPacketTransport, SyntheticAddressMap,
-        SyntheticNetworkConfiguration, SystemVpnPolicy, TcpFlowOutput, TcpOutput,
-        TransportSendError, UdpOutput, VpnRuntime, dns_query_allowed, emit_dns_refused,
-        flow_output, network_target_for, run_dns_tcp_flow, run_health_udp_flow,
-        synthesize_dns_command, synthetic_address_map, take_dns_tcp_frame,
+        SyntheticNetworkConfiguration, TcpFlowOutput, TcpOutput, TransportSendError, UdpOutput,
+        VpnRuntime, dns_query_allowed, emit_dns_refused, flow_output, network_target_for,
+        run_dns_tcp_flow, run_health_udp_flow, synthesize_dns_command, synthetic_address_map,
+        take_dns_tcp_frame,
     };
-    use crate::control::{OfferedSession, VpnScope};
-    use crate::network::{run_client_network_proxy, start_operator_network_session};
+    use crate::control::Capability;
+    use crate::domain::DnsName;
+    use crate::network::run_provider_network_session;
+    use crate::network::start_consumer_network_session;
     use crate::vpn::configuration::VpnNetworkConfiguration;
-    use crate::vpn::dns::{DnsName, Ipv4Pool, Ipv6Pool};
+    use crate::vpn::dns::{Ipv4Pool, Ipv6Pool};
     use crate::vpn::packet::{FlowId, TcpOpenRequest, UdpOpenRequest};
 
     #[derive(Clone)]
@@ -2135,16 +2137,14 @@ mod tests {
             let (operator_io, client_io) = tokio::io::duplex(64 * 1024);
             let operator = WebSocketStream::from_raw_socket(operator_io, Role::Server, None).await;
             let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-            let policy = SystemVpnPolicy::full_tunnel();
-            let client = AbortOnDropHandle::new(tokio::spawn(run_client_network_proxy(
+            let policy = NetworkPolicy::unrestricted();
+            let client = AbortOnDropHandle::new(tokio::spawn(run_provider_network_session(
                 client,
-                OfferedSession::Vpn {
-                    scope: VpnScope::System {
-                        policy: policy.clone(),
-                    },
+                Capability::Network {
+                    policy: policy.clone(),
                 },
             )));
-            let (session, runtime) = start_operator_network_session(operator).await.unwrap();
+            let (session, runtime) = start_consumer_network_session(operator).await.unwrap();
             let transport =
                 SessionPacketTransport::new(session, network, policy, Arc::clone(&mappings));
             for address in [IpAddr::V4(ipv4), IpAddr::V6(ipv6)] {
@@ -2503,16 +2503,14 @@ mod tests {
                 WebSocketStream::from_raw_socket(left, Role::Client, None),
                 WebSocketStream::from_raw_socket(right, Role::Server, None),
             );
-            let policy = SystemVpnPolicy::full_tunnel();
-            let _client = AbortOnDropHandle::new(tokio::spawn(run_client_network_proxy(
+            let policy = NetworkPolicy::unrestricted();
+            let _client = AbortOnDropHandle::new(tokio::spawn(run_provider_network_session(
                 client,
-                OfferedSession::Vpn {
-                    scope: VpnScope::System {
-                        policy: policy.clone(),
-                    },
+                Capability::Network {
+                    policy: policy.clone(),
                 },
             )));
-            let (session, _runtime) = start_operator_network_session(operator).await.unwrap();
+            let (session, _runtime) = start_consumer_network_session(operator).await.unwrap();
             let flow_id = FlowId::from_test_value(94);
             let (lifecycle, mut lifecycle_events) = mpsc::channel(2);
             let (data, mut data_events) = mpsc::channel(4);
@@ -2628,7 +2626,7 @@ mod tests {
     #[tokio::test]
     async fn scoped_dns_policy_rejects_misses_without_waiting_for_resolution() {
         let policy =
-            SystemVpnPolicy::new(Vec::new(), vec!["elevancehealth.com".to_string()]).unwrap();
+            NetworkPolicy::new(Vec::new(), vec!["elevancehealth.com".to_string()]).unwrap();
         let allowed = dns_query(1, "jira.elevancehealth.com", 1);
         let disallowed = dns_query(2, "public.example", 1);
         assert!(dns_query_allowed(&policy, &allowed));

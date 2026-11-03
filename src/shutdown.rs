@@ -48,3 +48,16 @@ impl Shutdown {
         Ok(Self { token, _task: task })
     }
 }
+
+pub(crate) fn combine_results(
+    primary: Result<()>,
+    secondary: Result<()>,
+    context: &str,
+) -> Result<()> {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error).context(context.to_string()),
+        (Err(primary), Err(secondary)) => Err(primary).context(format!("{context}: {secondary:#}")),
+    }
+}

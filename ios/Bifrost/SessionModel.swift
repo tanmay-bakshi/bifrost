@@ -3,56 +3,84 @@ import Foundation
 import UIKit
 
 struct SessionOffer {
-    let operatorName: String
+    let consumerName: String
     let description: String
     let mode: String
 }
 
 @MainActor
 final class SessionModel: ObservableObject {
-    @Published var serverURL = ""
+    enum ConnectionMode: String, CaseIterable, Identifiable {
+        case connect = "Connect"
+        case listen = "Listen"
+        var id: Self { self }
+    }
+
+    @Published var connectionMode = ConnectionMode.connect
+    @Published var peerURL = ""
+    @Published var listenAddress = "0.0.0.0:7071"
+    @Published var joinToken = UUID().uuidString
+
+    var canStart: Bool {
+        switch connectionMode {
+        case .connect: !peerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .listen: !listenAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !joinToken.isEmpty
+        }
+    }
     @Published var reconnect = false
     @Published var keepAwake = true {
         didSet { updateIdleTimer() }
     }
+    @Published private(set) var listenerURL: String?
     @Published private(set) var phase = "Ready"
     @Published private(set) var offer: SessionOffer?
     @Published private(set) var errorMessage: String?
     @Published private(set) var isRunning = false
     @Published private(set) var needsApproval = false
 
-    private var client: OpaquePointer?
+    private var peer: OpaquePointer?
     private var polling: Task<Void, Never>?
 
     private struct Configuration: Encodable {
-        let server: String
+        let endpoint: EndpointConfiguration
         let device_name: String
         let reconnect: Bool
+    }
+
+    private struct EndpointConfiguration: Encodable {
+        let kind: String
+        let url: String?
+        let address: String?
+        let join_token: String?
     }
 
     private struct Event: Decodable {
         let kind: String
         let phase: String?
-        let `operator`: String?
+        let join_url: String?
+        let consumer: String?
         let description: String?
         let mode: String?
         let message: String?
     }
 
     func connect() {
-        guard client == nil else { return }
+        guard peer == nil else { return }
         errorMessage = nil
+        listenerURL = nil
         offer = nil
         needsApproval = false
         do {
             let configuration = Configuration(
-                server: serverURL.trimmingCharacters(in: .whitespacesAndNewlines),
+                endpoint: connectionMode == .connect
+                    ? EndpointConfiguration(kind: "connect", url: peerURL.trimmingCharacters(in: .whitespacesAndNewlines), address: nil, join_token: nil)
+                    : EndpointConfiguration(kind: "listen", url: nil, address: listenAddress.trimmingCharacters(in: .whitespacesAndNewlines), join_token: joinToken),
                 device_name: UIDevice.current.name,
                 reconnect: reconnect
             )
             let data = try JSONEncoder().encode(configuration)
             let json = String(decoding: data, as: UTF8.self)
-            client = json.withCString { sshportal_client_create($0) }
+            peer = json.withCString { bifrost_peer_create($0) }
             isRunning = true
             phase = "Connecting"
             updateIdleTimer()
@@ -69,18 +97,20 @@ final class SessionModel: ObservableObject {
     }
 
     func approve(_ allowed: Bool) {
-        guard let client, needsApproval else { return }
+        guard let peer, needsApproval else { return }
         needsApproval = false
         phase = allowed ? "Starting session" : "Declining session"
-        sshportal_client_approve(client, allowed)
+        bifrost_peer_approve(peer, allowed)
     }
 
     func disconnect(reason: String = "Disconnected") {
         polling?.cancel()
         polling = nil
-        if let client { sshportal_client_free(client) }
-        client = nil
+        if let peer { bifrost_peer_free(peer) }
+        peer = nil
         isRunning = false
+        listenerURL = nil
+        offer = nil
         needsApproval = false
         phase = reason
         updateIdleTimer()
@@ -96,27 +126,28 @@ final class SessionModel: ObservableObject {
     }
 
     private func pollEvents() {
-        guard let client else { return }
+        guard let peer else { return }
         // Bound work on the UI thread. The Rust task remains the owner of networking.
         for _ in 0..<16 {
-            guard let pointer = sshportal_client_poll(client) else { return }
+            guard let pointer = bifrost_peer_poll(peer) else { return }
             let data = Data(bytes: pointer, count: strlen(pointer))
-            sshportal_string_free(pointer)
+            bifrost_string_free(pointer)
             do {
                 let event = try JSONDecoder().decode(Event.self, from: data)
+                if let joinURL = event.join_url { listenerURL = joinURL }
                 switch event.kind {
                 case "status":
                     switch event.phase {
-                    case "connecting": phase = "Connecting"
+                    case "connecting": phase = connectionMode == .listen ? "Waiting for a peer" : "Connecting"
                     case "connected": phase = "Connected"
                     case "reconnecting": phase = "Reconnecting"
                     default: break
                     }
                 case "offer":
-                    guard let name = event.operator, let description = event.description, let mode = event.mode else {
+                    guard let name = event.consumer, let description = event.description, let mode = event.mode else {
                         throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Incomplete session offer"))
                     }
-                    offer = SessionOffer(operatorName: name, description: description, mode: mode)
+                    offer = SessionOffer(consumerName: name, description: description, mode: mode)
                     needsApproval = true
                     phase = "Your approval is needed"
                 case "failed":

@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
-use crate::network::client_resolver::{ClientResolver, MAX_RESOLVED_ADDRESSES};
 use crate::network::protocol::{NetworkError, NetworkErrorKind, NetworkTarget};
+use crate::network::resolver::{MAX_RESOLVED_ADDRESSES, NativeResolver};
 
 const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -21,7 +21,7 @@ pub(super) struct ConnectedUdpSocket {
 
 async fn resolve_target(
     target: &NetworkTarget,
-    resolver: &ClientResolver,
+    resolver: &NativeResolver,
 ) -> Result<Vec<SocketAddr>, NetworkError> {
     tokio::time::timeout(
         RESOLUTION_TIMEOUT,
@@ -38,7 +38,7 @@ async fn resolve_target(
 
 pub(crate) async fn dial_tcp(
     target: &NetworkTarget,
-    resolver: &ClientResolver,
+    resolver: &NativeResolver,
 ) -> Result<TcpStream, NetworkError> {
     let addresses = resolve_target(target, resolver).await?;
     let mut attempts = JoinSet::new();
@@ -111,7 +111,7 @@ pub(crate) async fn dial_tcp(
 
 pub(super) async fn connect_udp(
     target: &NetworkTarget,
-    resolver: &ClientResolver,
+    resolver: &NativeResolver,
 ) -> Result<ConnectedUdpSocket, NetworkError> {
     let addresses = resolve_target(target, resolver).await?;
     let mut last_error = None;

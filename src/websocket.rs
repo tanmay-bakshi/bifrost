@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -16,7 +17,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls_platform_verifier::Verifier;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
@@ -26,8 +27,8 @@ use tokio_tungstenite::{
     },
 };
 use tokio_util::io::StreamReader;
+use tokio_util::sync::CancellationToken;
 use tokio_util::sync::PollSender;
-use tokio_util::task::AbortOnDropHandle;
 use url::{Host, Url};
 
 use crate::DEFAULT_CONNECT_PATH;
@@ -36,11 +37,58 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + Send {}
 
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Send {}
 
-pub trait WebSocketClientTransport: AsyncRead + AsyncWrite + Send + Unpin {}
+pub trait WebSocketTransport: AsyncRead + AsyncWrite + Send + Unpin {
+    fn addresses(&self) -> (SocketAddr, SocketAddr);
+}
 
-impl<T> WebSocketClientTransport for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+pin_project! {
+    pub(crate) struct AddressedTransport<T> {
+        #[pin]
+        inner: T,
+        local: SocketAddr,
+        peer: SocketAddr,
+    }
+}
 
-pub type ClientWebSocketStream = WebSocketStream<MaybeTlsStream<Box<dyn WebSocketClientTransport>>>;
+impl<T> AddressedTransport<T> {
+    pub(crate) fn new(inner: T, local: SocketAddr, peer: SocketAddr) -> Self {
+        Self { inner, local, peer }
+    }
+}
+
+impl<T: AsyncRead> AsyncRead for AddressedTransport<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite> AsyncWrite for AddressedTransport<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, bytes)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> WebSocketTransport for AddressedTransport<T> {
+    fn addresses(&self) -> (SocketAddr, SocketAddr) {
+        (self.local, self.peer)
+    }
+}
+
+pub type PeerWebSocket = WebSocketStream<MaybeTlsStream<Box<dyn WebSocketTransport>>>;
 
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 8192;
 const MAX_WEBSOCKET_IO_WRITE_BYTES: usize = 16 * 1024;
@@ -77,18 +125,19 @@ pin_project! {
 enum WebSocketWriteCommand {
     Data(Bytes),
     Flush(oneshot::Sender<()>),
-    Shutdown,
+    Shutdown(oneshot::Sender<()>),
 }
 
 enum WebSocketWriterState {
     Open,
     Flushing(oneshot::Receiver<()>),
     ReservingShutdown,
-    ShuttingDown,
+    ShuttingDown(oneshot::Receiver<()>),
     Closed,
     Failed(StoredIoError),
 }
 
+#[derive(Clone)]
 struct StoredIoError {
     kind: io::ErrorKind,
     message: String,
@@ -97,7 +146,19 @@ struct StoredIoError {
 struct WebSocketWriter {
     commands: PollSender<WebSocketWriteCommand>,
     state: WebSocketWriterState,
-    pump: Option<AbortOnDropHandle<io::Result<()>>>,
+    pump: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    abandoned: CancellationToken,
+}
+
+impl Drop for WebSocketWriter {
+    fn drop(&mut self) {
+        if matches!(self.state, WebSocketWriterState::Closed) {
+            // A flushed directional EOF leaves a bounded close exchange owned by the driver.
+            self.abandoned.cancel();
+        } else if let Some(pump) = &self.pump {
+            pump.abort();
+        }
+    }
 }
 
 impl<R, W> AsyncRead for DuplexIo<R, W>
@@ -151,7 +212,7 @@ impl AsyncWrite for WebSocketWriter {
         match &this.state {
             WebSocketWriterState::Open => {}
             WebSocketWriterState::ReservingShutdown
-            | WebSocketWriterState::ShuttingDown
+            | WebSocketWriterState::ShuttingDown(_)
             | WebSocketWriterState::Closed => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -231,7 +292,7 @@ impl WebSocketWriter {
                     self.state = WebSocketWriterState::Flushing(completion);
                 }
                 WebSocketWriterState::Flushing(_) => return self.poll_flush_barrier(cx),
-                WebSocketWriterState::ReservingShutdown | WebSocketWriterState::ShuttingDown => {
+                WebSocketWriterState::ReservingShutdown | WebSocketWriterState::ShuttingDown(_) => {
                     return self.poll_shutdown_inner(cx);
                 }
                 WebSocketWriterState::Closed => return Poll::Ready(Ok(())),
@@ -272,17 +333,27 @@ impl WebSocketWriter {
                         Poll::Ready(Err(_)) => return self.poll_closed_channel(cx),
                         Poll::Pending => return Poll::Pending,
                     }
+                    let (completed, completion) = oneshot::channel();
                     if self
                         .commands
-                        .send_item(WebSocketWriteCommand::Shutdown)
+                        .send_item(WebSocketWriteCommand::Shutdown(completed))
                         .is_err()
                     {
                         return self.poll_closed_channel(cx);
                     }
                     self.commands.close();
-                    self.state = WebSocketWriterState::ShuttingDown;
+                    self.state = WebSocketWriterState::ShuttingDown(completion);
                 }
-                WebSocketWriterState::ShuttingDown => return self.poll_pump_completion(cx),
+                WebSocketWriterState::ShuttingDown(ref mut completion) => {
+                    match Pin::new(completion).poll(cx) {
+                        Poll::Ready(Ok(())) => {
+                            self.state = WebSocketWriterState::Closed;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Err(_)) => return self.poll_closed_channel(cx),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
                 WebSocketWriterState::Closed => return Poll::Ready(Ok(())),
                 WebSocketWriterState::Failed(ref error) => {
                     return Poll::Ready(Err(error.to_io_error()));
@@ -347,31 +418,29 @@ impl WebSocketWriter {
     }
 }
 
-fn start_websocket_writer<W>(sink: W) -> WebSocketWriter
-where
-    W: Sink<Message, Error = WebSocketError> + Unpin + Send + 'static,
-{
-    start_websocket_writer_with_capacity(sink, WEBSOCKET_WRITER_QUEUE_FRAMES)
-}
-
-fn start_websocket_writer_with_capacity<W>(sink: W, capacity: usize) -> WebSocketWriter
+#[cfg(test)]
+fn start_websocket_writer_with_capacity<W>(
+    sink: W,
+    capacity: usize,
+    peer_finished: oneshot::Receiver<io::Result<()>>,
+) -> WebSocketWriter
 where
     W: Sink<Message, Error = WebSocketError> + Unpin + Send + 'static,
 {
     let (commands, receiver) = mpsc::channel(capacity);
-    // A write is acknowledged only after the bounded channel owns its bytes, and
-    // this handle prevents the sink-driving task from outliving the adapter.
-    let pump = AbortOnDropHandle::new(tokio::spawn(run_websocket_writer(sink, receiver)));
+    let pump = tokio::spawn(run_websocket_writer(sink, receiver, peer_finished));
     WebSocketWriter {
         commands: PollSender::new(commands),
         state: WebSocketWriterState::Open,
         pump: Some(pump),
+        abandoned: CancellationToken::new(),
     }
 }
 
 async fn run_websocket_writer<W>(
     mut sink: W,
     mut commands: mpsc::Receiver<WebSocketWriteCommand>,
+    peer_finished: oneshot::Receiver<io::Result<()>>,
 ) -> io::Result<()>
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
@@ -386,8 +455,20 @@ where
                 sink.flush().await.map_err(map_websocket_error)?;
                 let _ = completed.send(());
             }
-            WebSocketWriteCommand::Shutdown => {
-                sink.close().await.map_err(map_websocket_error)?;
+            WebSocketWriteCommand::Shutdown(completed) => {
+                // Empty binary messages terminate one direction without closing the reverse stream.
+                sink.send(Message::Binary(Bytes::new()))
+                    .await
+                    .map_err(map_websocket_error)?;
+                let _ = completed.send(());
+                peer_finished.await.map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket reader stopped before directional EOF",
+                    )
+                })??;
+                // Both byte streams are complete. The WebSocket close exchange is transport cleanup.
+                let _ = sink.close().await;
                 return Ok(());
             }
         }
@@ -395,14 +476,14 @@ where
     Ok(())
 }
 
-pub async fn connect_async_with_env_proxy(url: &Url) -> Result<(ClientWebSocketStream, Response)> {
+pub async fn connect_async_with_env_proxy(url: &Url) -> Result<(PeerWebSocket, Response)> {
     connect_async_with_env_proxy_and_extra_roots(url, Vec::new()).await
 }
 
 pub async fn connect_async_with_env_proxy_and_extra_roots(
     url: &Url,
     extra_roots: Vec<CertificateDer<'static>>,
-) -> Result<(ClientWebSocketStream, Response)> {
+) -> Result<(PeerWebSocket, Response)> {
     crate::install_default_rustls_crypto_provider();
     let matcher = Matcher::from_env();
     let tls_config = tls_client_config(extra_roots)?;
@@ -415,35 +496,177 @@ pub async fn connect_async_with_env_proxy_and_extra_roots(
     .await
 }
 
-pub fn websocket_to_io<S>(websocket: WebSocketStream<S>) -> Pin<Box<dyn AsyncStream + 'static>>
+/// A bounded duplex byte stream with independent directional EOF and owned physical cleanup.
+pub struct WebSocketIo {
+    inner: Pin<Box<dyn AsyncStream + 'static>>,
+    completion: TransportCompletion,
+}
+
+impl AsyncRead for WebSocketIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.inner.as_mut().poll_read(cx, output)
+    }
+}
+impl AsyncWrite for WebSocketIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.as_mut().poll_write(cx, bytes)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.as_mut().poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.as_mut().poll_shutdown(cx)
+    }
+}
+impl WebSocketIo {
+    pub(crate) fn completion(&self) -> TransportCompletion {
+        self.completion.clone()
+    }
+}
+
+#[derive(Clone)]
+enum TransportState {
+    Running,
+    Closed,
+    Failed(StoredIoError),
+}
+
+#[derive(Clone)]
+pub(crate) struct TransportCompletion(watch::Receiver<TransportState>);
+impl TransportCompletion {
+    pub(crate) async fn wait(mut self) -> io::Result<()> {
+        loop {
+            match self.0.borrow_and_update().clone() {
+                TransportState::Running => {}
+                TransportState::Closed => return Ok(()),
+                TransportState::Failed(error) => return Err(error.to_io_error()),
+            }
+            self.0.changed().await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "WebSocket transport stopped before completion",
+                )
+            })?;
+        }
+    }
+}
+
+pub fn websocket_to_io<S>(websocket: WebSocketStream<S>) -> WebSocketIo
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (sink, stream) = websocket.split();
-    Box::pin(DuplexIo {
-        reader: StreamReader::new(websocket_reader(stream)),
-        writer: start_websocket_writer(sink),
-    })
+    let (incoming, receiver) = mpsc::channel(1);
+    let (commands, outgoing) = mpsc::channel(WEBSOCKET_WRITER_QUEUE_FRAMES);
+    let (finished, peer_finished) = oneshot::channel();
+    let abandoned = CancellationToken::new();
+    let reader_abandoned = abandoned.clone();
+    let stop_reader = CancellationToken::new();
+    let reader_stopped = stop_reader.clone();
+    let (completion, completed) = watch::channel(TransportState::Running);
+    let pump = tokio::spawn(async move {
+        let read =
+            run_websocket_reader(stream, incoming, finished, reader_abandoned, reader_stopped);
+        let write = async {
+            let result = run_websocket_writer(sink, outgoing, peer_finished).await;
+            stop_reader.cancel();
+            result
+        };
+        let (_, result) = tokio::join!(read, write);
+        let state = match &result {
+            Ok(()) => TransportState::Closed,
+            Err(error) => TransportState::Failed(StoredIoError {
+                kind: error.kind(),
+                message: error.to_string(),
+            }),
+        };
+        completion.send_replace(state);
+        result
+    });
+    let input = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    let inner = Box::pin(DuplexIo {
+        reader: StreamReader::new(Box::pin(input)),
+        writer: WebSocketWriter {
+            commands: PollSender::new(commands),
+            state: WebSocketWriterState::Open,
+            pump: Some(pump),
+            abandoned,
+        },
+    });
+    WebSocketIo {
+        inner,
+        completion: TransportCompletion(completed),
+    }
 }
 
-fn websocket_reader<S>(
-    stream: SplitStream<WebSocketStream<S>>,
-) -> impl futures_util::stream::Stream<Item = io::Result<Bytes>>
-where
+async fn run_websocket_reader<S>(
+    mut stream: SplitStream<WebSocketStream<S>>,
+    incoming: mpsc::Sender<io::Result<Bytes>>,
+    finished: oneshot::Sender<io::Result<()>>,
+    abandoned: CancellationToken,
+    stopped: CancellationToken,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    stream.filter_map(|message_result| async move {
-        match message_result {
-            Ok(Message::Binary(bytes)) => Some(Ok(bytes)),
-            Ok(Message::Text(_)) => Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "received a websocket text frame during binary transport",
-            ))),
-            Ok(Message::Close(_)) => None,
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => None,
-            Err(error) => Some(Err(map_websocket_error(error))),
+    let mut closing_deadline = None;
+    let error = loop {
+        let message = tokio::select! {
+            biased;
+            _ = stopped.cancelled() => return,
+            _ = abandoned.cancelled(), if closing_deadline.is_none() => {
+                closing_deadline = Some(Instant::now() + Duration::from_secs(10));
+                continue;
+            }
+            _ = async {
+                match closing_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await }
+            } => break io::Error::new(io::ErrorKind::TimedOut, "peer did not complete directional EOF during transport cleanup"),
+            message = stream.next() => message,
+        };
+        match message {
+            Some(Ok(Message::Binary(bytes))) if bytes.is_empty() => {
+                let _ = finished.send(Ok(()));
+                return;
+            }
+            Some(Ok(Message::Binary(bytes))) => {
+                // Once the application drops its read half, drain without buffering until peer EOF.
+                // The abandonment deadline bounds this final transport ownership.
+                tokio::select! {
+                    _ = stopped.cancelled() => return,
+                    result = incoming.send(Ok(bytes)) => { let _ = result; }
+                }
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+            Some(Ok(Message::Text(_))) => {
+                break io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "received a WebSocket text frame during binary transport",
+                );
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                break io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "WebSocket closed before directional EOF",
+                );
+            }
+            Some(Err(error)) => break map_websocket_error(error),
         }
-    })
+    };
+    let error = StoredIoError::new(error);
+    let _ = finished.send(Err(error.to_io_error()));
+    tokio::select! {
+        _ = stopped.cancelled() => {},
+        result = incoming.send(Err(error.to_io_error())) => { let _ = result; }
+    }
 }
 
 fn map_websocket_error(error: WebSocketError) -> io::Error {
@@ -465,7 +688,7 @@ fn map_websocket_error(error: WebSocketError) -> io::Error {
 async fn connect_async_with_proxy_matcher(
     url: &Url,
     matcher: &Matcher,
-) -> Result<(ClientWebSocketStream, Response)> {
+) -> Result<(PeerWebSocket, Response)> {
     connect_async_with_proxy_matcher_and_timeouts(url, matcher, WEBSOCKET_CONNECT_TIMEOUTS).await
 }
 
@@ -474,7 +697,7 @@ async fn connect_async_with_proxy_matcher_and_timeouts(
     url: &Url,
     matcher: &Matcher,
     timeouts: WebSocketConnectTimeouts,
-) -> Result<(ClientWebSocketStream, Response)> {
+) -> Result<(PeerWebSocket, Response)> {
     connect_async_with_proxy_matcher_and_timeouts_with_tls(
         url,
         matcher,
@@ -489,7 +712,7 @@ async fn connect_async_with_proxy_matcher_and_timeouts_with_tls(
     matcher: &Matcher,
     timeouts: WebSocketConnectTimeouts,
     tls_config: Arc<rustls::ClientConfig>,
-) -> Result<(ClientWebSocketStream, Response)> {
+) -> Result<(PeerWebSocket, Response)> {
     let overall_deadline = Instant::now() + timeouts.overall;
     let maybe_proxy = selected_proxy_for_websocket_url(matcher, url)?;
     let stream = match maybe_proxy {
@@ -564,17 +787,19 @@ async fn connect_direct(
     url: &Url,
     overall_deadline: Instant,
     timeouts: WebSocketConnectTimeouts,
-) -> Result<Box<dyn WebSocketClientTransport>> {
+) -> Result<Box<dyn WebSocketTransport>> {
     let (host, port) = destination_host_and_port(url)?;
     let socket = open_tcp_stream(
         &host,
         port,
-        "sshportal server",
+        "bifrost server",
         overall_deadline,
         timeouts.tcp,
     )
     .await?;
-    Ok(Box::new(socket))
+    let local = socket.local_addr()?;
+    let peer = socket.peer_addr()?;
+    Ok(Box::new(AddressedTransport::new(socket, local, peer)))
 }
 
 async fn connect_via_proxy(
@@ -583,7 +808,7 @@ async fn connect_via_proxy(
     overall_deadline: Instant,
     timeouts: WebSocketConnectTimeouts,
     tls_config: Arc<rustls::ClientConfig>,
-) -> Result<Box<dyn WebSocketClientTransport>> {
+) -> Result<Box<dyn WebSocketTransport>> {
     let (proxy_host, proxy_port, proxy_scheme) = proxy_endpoint(proxy)?;
     let proxy_socket = open_tcp_stream(
         &proxy_host,
@@ -593,9 +818,11 @@ async fn connect_via_proxy(
         timeouts.tcp,
     )
     .await?;
-    let mut proxy_stream: Box<dyn WebSocketClientTransport> = match proxy_scheme.as_str() {
-        "http" => Box::new(proxy_socket),
-        "https" => Box::new(
+    let local = proxy_socket.local_addr()?;
+    let peer = proxy_socket.peer_addr()?;
+    let mut proxy_stream: Box<dyn WebSocketTransport> = match proxy_scheme.as_str() {
+        "http" => Box::new(AddressedTransport::new(proxy_socket, local, peer)),
+        "https" => Box::new(AddressedTransport::new(
             run_connect_phase(
                 overall_deadline,
                 timeouts.proxy_tls,
@@ -603,7 +830,9 @@ async fn connect_via_proxy(
                 connect_to_https_proxy(proxy_socket, &proxy_host, tls_config),
             )
             .await??,
-        ),
+            local,
+            peer,
+        )),
         unsupported => {
             bail!(
                 "unsupported proxy scheme `{unsupported}`; only http:// and https:// proxies are supported"
@@ -759,7 +988,7 @@ fn build_tls_client_config(
 }
 
 async fn establish_connect_tunnel(
-    stream: &mut dyn WebSocketClientTransport,
+    stream: &mut dyn WebSocketTransport,
     destination_host: &str,
     destination_port: u16,
     proxy_auth: Option<&HeaderValue>,
@@ -786,7 +1015,7 @@ async fn establish_connect_tunnel(
     validate_connect_response(&response)
 }
 
-async fn read_proxy_response_headers(stream: &mut dyn WebSocketClientTransport) -> Result<Vec<u8>> {
+async fn read_proxy_response_headers(stream: &mut dyn WebSocketTransport) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 1024];
 
@@ -1016,6 +1245,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn directional_eof_preserves_a_large_reverse_stream() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (left, right) = tokio::io::duplex(1024);
+            let left = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                left,
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            let right = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                right,
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            let mut left = super::websocket_to_io(left);
+            let mut right = super::websocket_to_io(right);
+            let request = async {
+                left.write_all(b"request").await.unwrap();
+                left.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                left.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, vec![42_u8; 512 * 1024]);
+            };
+            let response = async {
+                let mut request = Vec::new();
+                right.read_to_end(&mut request).await.unwrap();
+                assert_eq!(request, b"request");
+                right.write_all(&vec![42_u8; 512 * 1024]).await.unwrap();
+                right.shutdown().await.unwrap();
+            };
+            tokio::join!(request, response);
+        })
+        .await
+        .expect("directional EOF blocked reverse traffic");
+    }
+
     #[test]
     fn converts_http_to_websocket() {
         let url = normalize_websocket_url("http://127.0.0.1:8080").unwrap();
@@ -1167,7 +1434,8 @@ mod tests {
             pending: None,
             delivered,
         };
-        let mut writer = start_websocket_writer_with_capacity(sink, 1);
+        let mut writer =
+            start_websocket_writer_with_capacity(sink, 1, tokio::sync::oneshot::channel().1);
 
         writer
             .write_all(b"SSH-2.0-identification\r\n")
@@ -1192,7 +1460,8 @@ mod tests {
             flush_allowed: Arc::clone(&flush_allowed),
             flush_waker: Arc::clone(&flush_waker),
         };
-        let mut writer = start_websocket_writer_with_capacity(sink, 1);
+        let mut writer =
+            start_websocket_writer_with_capacity(sink, 1, tokio::sync::oneshot::channel().1);
 
         writer.write_all(b"blocked-in-pump").await.unwrap();
         assert_eq!(observations.recv().await.unwrap(), &b"blocked-in-pump"[..]);

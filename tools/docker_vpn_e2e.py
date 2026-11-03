@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run an isolated Linux end-to-end validation of sshportal VPN mode."""
+"""Run an isolated Linux end-to-end validation of bifrost VPN mode."""
 
 import argparse
 import ipaddress
@@ -27,19 +27,19 @@ from docker_e2e import (
 )
 
 
-CONTROL_NETWORK: str = "sshportal-vpn-e2e-control"
-EGRESS_NETWORK: str = "sshportal-vpn-e2e-egress"
-SERVER_NAME: str = "sshportal-vpn-e2e-server"
-CLIENT_NAME: str = "sshportal-vpn-e2e-client"
-PROXY_NAME: str = "sshportal-vpn-e2e-proxy"
-ECHO_NAME: str = "sshportal-vpn-e2e-echo"
+CONTROL_NETWORK: str = "bifrost-vpn-e2e-control"
+EGRESS_NETWORK: str = "bifrost-vpn-e2e-egress"
+SERVER_NAME: str = "bifrost-vpn-e2e-server"
+CLIENT_NAME: str = "bifrost-vpn-e2e-client"
+PROXY_NAME: str = "bifrost-vpn-e2e-proxy"
+ECHO_NAME: str = "bifrost-vpn-e2e-echo"
 JOIN_TOKEN: str = "vpn-e2e-token"
 TEST_DNS_SERVER: str = "203.0.113.53"
 CLOSE_DELIMITED_BODY_SIZE: int = 256 * 1024
 SERVER_IMAGE_SUFFIX: str = "-vpn-systemd-resolved"
-SERVER_READY_FILE: str = "/run/sshportal-vpn-e2e-ready"
-SERVER_PID_FILE: str = "/run/sshportal-server.pid"
-RECOVERY_JOURNAL: str = "/var/run/sshportal/network-state.jsonl"
+SERVER_READY_FILE: str = "/run/bifrost-vpn-e2e-ready"
+SERVER_PID_FILE: str = "/run/bifrost-consumer.pid"
+RECOVERY_JOURNAL: str = "/var/run/bifrost/network-state.jsonl"
 ECHO_DOMAIN: str = "echo.test"
 SYNTHETIC_IPV4_RANGE: ipaddress.IPv4Network = ipaddress.IPv4Network("198.18.0.0/15")
 POLICY_ROUTE_TABLE: int = 100
@@ -157,7 +157,7 @@ def generate_tls_material(directory: Path) -> None:
             "-days",
             "1",
             "-subj",
-            "/CN=sshportal VPN E2E CA",
+            "/CN=bifrost VPN E2E CA",
             "-addext",
             "basicConstraints=critical,CA:TRUE",
             "-addext",
@@ -218,7 +218,7 @@ def generate_tls_material(directory: Path) -> None:
 def start_echo_service(image_tag: str) -> str:
     """Start TCP and UDP echo endpoints reachable only from the client.
 
-    :param image_tag: Existing sshportal runtime image.
+    :param image_tag: Existing bifrost runtime image.
     :returns: Echo container IPv4 address.
     """
 
@@ -277,7 +277,7 @@ def start_echo_service(image_tag: str) -> str:
 def build_server_image(image_tag: str, platform: str | None) -> str:
     """Build the privileged test runtime with a real systemd-resolved control plane.
 
-    :param image_tag: Existing sshportal runtime image containing the static binaries.
+    :param image_tag: Existing bifrost runtime image containing the static binaries.
     :param platform: Optional Docker platform such as ``linux/amd64``.
     :returns: Derived server runtime image tag.
     """
@@ -289,9 +289,9 @@ def build_server_image(image_tag: str, platform: str | None) -> str:
         "build",
         "--load",
         "--build-arg",
-        f"SSHPORTAL_IMAGE={image_tag}",
+        f"BIFROST_IMAGE={image_tag}",
         "--file",
-        "tools/vpn_e2e_server.Dockerfile",
+        "tools/vpn_e2e_consumer.Dockerfile",
         "--tag",
         server_image_tag,
     ]
@@ -335,9 +335,9 @@ def start_server(
     include_cidr: str | None,
     include_domain: str | None,
 ) -> SpawnedProcess:
-    """Start the privileged operator-side VPN server container.
+    """Start the privileged VPN consumer container.
 
-    :param image_tag: Existing sshportal runtime image.
+    :param image_tag: Existing bifrost runtime image.
     :param include_cidr: Optional CIDR for a selective VPN session.
     :param include_domain: Optional domain suffix for a selective VPN session.
     :returns: Attached server process.
@@ -362,7 +362,7 @@ def start_server(
             "--device",
             "/dev/net/tun",
             "-e",
-            "SSHPORTAL_DEBUG=1",
+            "BIFROST_DEBUG=1",
             image_tag,
             "sleep",
             "infinity",
@@ -371,19 +371,20 @@ def start_server(
     wait_for_server_fixture()
 
     server_command: list[str] = [
-        "/usr/local/bin/sshportal-server",
+        "/usr/local/bin/bifrost",
+        "access",
         "--listen",
         "0.0.0.0:8080",
-        "--operator-name",
+        "--consumer-name",
         "support-team",
         "--join-token",
         JOIN_TOKEN,
         "--vpn",
     ]
     if include_cidr is not None:
-        server_command.extend(["--vpn-include-cidr", include_cidr])
+        server_command.extend(["--include-cidr", include_cidr])
     if include_domain is not None:
-        server_command.extend(["--vpn-include-domain", include_domain])
+        server_command.extend(["--include-domain", include_domain])
     return spawn_pty_process(
         "VPN server",
         [
@@ -395,7 +396,7 @@ def start_server(
             "/bin/bash",
             "-lc",
             f"printf '%s\\n' \"$BASHPID\" > {SERVER_PID_FILE}; exec \"$@\"",
-            "sshportal-vpn-e2e-server",
+            "bifrost-vpn-e2e-server",
             *server_command,
         ],
     )
@@ -613,9 +614,9 @@ def configure_source_policy_routing(transport_peer: str) -> None:
 
 
 def start_unprivileged_client(image_tag: str, certificate_directory: Path) -> SpawnedProcess:
-    """Create a two-network client container and run sshportal without privileges.
+    """Create a two-network client container and run bifrost without privileges.
 
-    :param image_tag: Existing sshportal runtime image.
+    :param image_tag: Existing bifrost runtime image.
     :param certificate_directory: Directory containing the test CA.
     :returns: Attached client process.
     """
@@ -632,7 +633,7 @@ def start_unprivileged_client(image_tag: str, certificate_directory: Path) -> Sp
             "--network",
             EGRESS_NETWORK,
             "-v",
-            f"{certificate_directory / 'ca.crt'}:/usr/local/share/ca-certificates/sshportal-e2e.crt:ro",
+            f"{certificate_directory / 'ca.crt'}:/usr/local/share/ca-certificates/bifrost-e2e.crt:ro",
             "-e",
             "TERM=dumb",
             "-it",
@@ -641,7 +642,7 @@ def start_unprivileged_client(image_tag: str, certificate_directory: Path) -> Sp
             "-lc",
             "update-ca-certificates >/dev/null && "
             "exec su nobody -s /bin/sh -c "
-            f"'/usr/local/bin/sshportal-client --server \"{client_url}\" --approve-session'",
+            f"'/usr/local/bin/bifrost provide --connect \"{client_url}\" --approve-session'",
         ]
     )
     run_checked(
@@ -672,7 +673,7 @@ def assert_client_is_unprivileged() -> None:
 
 
 def run_probe(command: list[str], expected: str, label: str) -> str:
-    """Run an operator-side probe and require expected output.
+    """Run an consumer probe and require expected output.
 
     :param command: Command to run inside the server container.
     :param expected: Required output fragment.
@@ -687,7 +688,7 @@ def run_probe(command: list[str], expected: str, label: str) -> str:
 
 
 def run_probe_excluding(command: list[str], unexpected: str, label: str) -> None:
-    """Run an operator-side probe and reject an unexpected output fragment.
+    """Run an consumer probe and reject an unexpected output fragment.
 
     :param command: Command to run inside the server container.
     :param unexpected: Output fragment that must not appear.
@@ -1001,7 +1002,7 @@ def run_vpn_session(
 ) -> None:
     """Run the complete WSS, TUN, TCP, UDP, DNS, and cleanup test.
 
-    :param image_tag: Existing sshportal runtime image.
+    :param image_tag: Existing bifrost runtime image.
     :param server_image_tag: Privileged test runtime with systemd-resolved.
     :param certificate_directory: Directory containing TLS test material.
     :param policy: Routing policy to exercise.
@@ -1017,13 +1018,13 @@ def run_vpn_session(
     server = start_server(server_image_tag, include_cidr, include_domain)
     client: SpawnedProcess | None = None
     try:
-        wait_for_text(server, "sshportal server listening on http://0.0.0.0:8080", 30.0)
+        wait_for_text(server, "Bifrost listening on http://0.0.0.0:8080", 30.0)
         start_tls_proxy(certificate_directory)
         transport_peer = container_ipv4_address(PROXY_NAME, CONTROL_NETWORK)
         configure_source_policy_routing(transport_peer)
         client = start_unprivileged_client(image_tag, certificate_directory)
         assert_client_is_unprivileged()
-        wait_for_text(client, "VPN egress session approved", 30.0)
+        wait_for_text(client, "network access approved", 30.0)
         server_transcript = wait_for_text(server, "VPN active on interface", 30.0)
         interface_match = re.search(r"VPN active on interface (\S+)", server_transcript)
         if interface_match is None:
@@ -1101,7 +1102,7 @@ def run_vpn_session(
             run_probe(
                 ["wget", "-qO-", "-T", "10", f"http://{ECHO_DOMAIN}:8081/"],
                 "vpn-tcp-ok",
-                "virtual DNS and client-side resolution",
+                "virtual DNS and provider resolution",
             )
         run_probe(
             [
