@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run a Linux Docker-backed end-to-end validation of sshportal."""
+"""Run a Linux Docker-backed end-to-end validation of bifrost."""
 
 import argparse
 import errno
@@ -27,10 +27,10 @@ from pathlib import Path
 
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
-IMAGE_TAG: str = "sshportal:e2e"
-NETWORK_NAME: str = "sshportal-e2e"
-SERVER_NAME: str = "sshportal-e2e-server"
-CLIENT_NAME: str = "sshportal-e2e-client"
+IMAGE_TAG: str = "bifrost:e2e"
+NETWORK_NAME: str = "bifrost-e2e"
+SERVER_NAME: str = "bifrost-e2e-server"
+CLIENT_NAME: str = "bifrost-e2e-client"
 HOST_PORT: int = 18080
 HOST_SSH_PORT: int = 18222
 READ_CHUNK_SIZE: int = 4096
@@ -94,7 +94,7 @@ def resolve_target_triple(requested_platform: str | None) -> str:
 
 
 def build_host_binaries(target_triple: str) -> None:
-    """Build the static Linux binaries on the host before image assembly.
+    """Build the static Linux executable before image assembly.
 
     :param target_triple: Rust target triple to build.
     """
@@ -173,7 +173,7 @@ def resolve_build_environment(target_triple: str) -> dict[str, str]:
 
 
 def build_image(image_tag: str, platform: str | None) -> None:
-    """Build the Docker runtime image for both binaries.
+    """Build the Docker runtime image for Bifrost.
 
     :param image_tag: Image tag to build.
     :param platform: Optional Docker platform such as ``linux/amd64``.
@@ -407,7 +407,7 @@ def run_shell_command(
     :returns: Command output between command echo and completion marker.
     """
 
-    marker = f"__SSHPORTAL_{marker_name}__"
+    marker = f"__BIFROST_{marker_name}__"
     before_length = len(spawned.transcript)
     send_input(spawned, f"{command}; printf '{marker}:%s\\n' \"$?\"\n")
     marker_pattern = re.compile(rf"(?:^|\r?\n)({re.escape(marker)}:\d+)")
@@ -455,7 +455,7 @@ def container_home_file(container_name: str, relative_path: str) -> str:
     return completed.stdout
 
 
-def generate_operator_key(directory: Path) -> Path:
+def generate_consumer_key(directory: Path) -> Path:
     """Generate an SSH keypair for the persistent-access test.
 
     :param directory: Directory to place the keypair in.
@@ -481,10 +481,10 @@ def generate_operator_key(directory: Path) -> Path:
     return private_key
 
 
-def start_operator_shell(operator_key: Path) -> SpawnedProcess:
-    """Launch a local SSH client against the published server-side proxy.
+def start_operator_shell(consumer_key: Path) -> SpawnedProcess:
+    """Launch a local SSH client against the published consumer SSH proxy.
 
-    :param operator_key: Private key path used for proxy authentication.
+    :param consumer_key: Private key path used for proxy authentication.
     :returns: Running operator shell descriptor.
     :raises RuntimeError: If the host ``ssh`` client is unavailable.
     """
@@ -503,7 +503,7 @@ def start_operator_shell(operator_key: Path) -> SpawnedProcess:
             "-p",
             str(HOST_SSH_PORT),
             "-i",
-            str(operator_key),
+            str(consumer_key),
             "-o",
             "IdentitiesOnly=yes",
             "-o",
@@ -555,14 +555,14 @@ def wait_for_process_exit(spawned: SpawnedProcess, timeout_seconds: float) -> in
 def start_server(
     *,
     image_tag: str,
-    operator_key: Path | None,
+    consumer_key: Path | None,
     persist_key: bool,
     platform: str | None,
 ) -> SpawnedProcess:
     """Launch the server container.
 
     :param image_tag: Docker image tag to run.
-    :param operator_key: Optional private key path to mount into the container.
+    :param consumer_key: Optional private key path to mount into the container.
     :param persist_key: Whether the server should request key persistence.
     :param platform: Optional Docker platform such as ``linux/amd64``.
     :returns: Running server process descriptor.
@@ -587,31 +587,32 @@ def start_server(
     ]
     if platform is not None:
         command.extend(["--platform", platform])
-    if operator_key is not None:
+    if consumer_key is not None:
         command.extend(
             [
                 "-v",
-                f"{operator_key}:{operator_key}:ro",
+                f"{consumer_key}:{consumer_key}:ro",
             ]
         )
     command.extend(
         [
             "-e",
-            "SSHPORTAL_DEBUG=1",
+            "BIFROST_DEBUG=1",
             image_tag,
-            "/usr/local/bin/sshportal-server",
+            "/usr/local/bin/bifrost",
+        "access",
             "--listen",
             "0.0.0.0:8080",
-            "--operator-name",
+            "--consumer-name",
             "support-team",
             "--ssh-listen",
             "0.0.0.0:2222",
         ]
     )
-    if operator_key is not None:
-        command.extend(["--operator-key", str(operator_key)])
+    if consumer_key is not None:
+        command.extend(["--consumer-key", str(consumer_key)])
     if persist_key:
-        command.append("--persist-operator-key")
+        command.append("--persist-consumer-key")
     return spawn_pty_process("server", command)
 
 
@@ -657,7 +658,7 @@ def start_client(*, image_tag: str, platform: str | None, server_url: str) -> Sp
         "-w",
         "/support-workspace",
         "-e",
-        "SSHPORTAL_DEBUG=1",
+        "BIFROST_DEBUG=1",
         "-e",
         "TERM=dumb",
         "-it",
@@ -667,8 +668,9 @@ def start_client(*, image_tag: str, platform: str | None, server_url: str) -> Sp
     command.extend(
         [
             image_tag,
-            "/usr/local/bin/sshportal-client",
-            "--server",
+            "/usr/local/bin/bifrost",
+            "provide",
+            "--connect",
             server_url,
         ]
     )
@@ -679,20 +681,20 @@ def run_session(
     *,
     image_tag: str,
     persist_key: bool,
-    operator_key: Path | None,
+    consumer_key: Path | None,
     platform: str | None,
 ) -> None:
     """Run one complete server/client session and assert expected behavior.
 
     :param image_tag: Docker image tag to run.
     :param persist_key: Whether to test authorized_keys installation.
-    :param operator_key: Optional persistent operator key path.
+    :param consumer_key: Optional persistent consumer key path.
     :param platform: Optional Docker platform such as ``linux/amd64``.
     """
 
     server = start_server(
         image_tag=image_tag,
-        operator_key=operator_key,
+        consumer_key=consumer_key,
         persist_key=persist_key,
         platform=platform,
     )
@@ -700,7 +702,7 @@ def run_session(
     operator: SpawnedProcess | None = None
     try:
         try:
-            wait_for_text(server, "sshportal server listening on http://0.0.0.0:8080", 30.0)
+            wait_for_text(server, "Bifrost listening on http://0.0.0.0:8080", 30.0)
             health_body = wait_for_http(f"http://127.0.0.1:{HOST_PORT}/healthz", 15.0)
             if "\"phase\":\"waiting\"" not in health_body:
                 raise RuntimeError(f"unexpected health response before connect: {health_body}")
@@ -728,9 +730,9 @@ def run_session(
 
             assert_http_unreachable(f"http://127.0.0.1:{HOST_PORT}/healthz", 15.0)
             wait_for_text(server, "SSH proxy listening on 0.0.0.0:2222", 15.0)
-            if operator_key is None:
-                raise RuntimeError("run_session requires an operator key for proxy access")
-            operator = start_operator_shell(operator_key)
+            if consumer_key is None:
+                raise RuntimeError("run_session requires an consumer key for proxy access")
+            operator = start_operator_shell(consumer_key)
             time.sleep(1.0)
 
             pwd_output = run_shell_command(operator, "pwd", "PWD", 15.0)
@@ -839,7 +841,7 @@ def run_session(
                 key_data = container_home_file(CLIENT_NAME, "/root/.ssh/authorized_keys")
                 if "ssh-ed25519 " not in key_data:
                     raise session_failure(
-                        "authorized_keys did not contain the persisted operator key",
+                        "authorized_keys did not contain the persisted consumer key",
                         server,
                         client,
                     )
@@ -858,24 +860,24 @@ def run_session(
         remove_container(SERVER_NAME)
 
 
-def run_disconnect_test(*, image_tag: str, operator_key: Path, platform: str | None) -> None:
+def run_disconnect_test(*, image_tag: str, consumer_key: Path, platform: str | None) -> None:
     """Verify that killing the client causes the server to exit cleanly.
 
     :param image_tag: Docker image tag to run.
-    :param operator_key: Private key path used for proxy authentication.
+    :param consumer_key: Private key path used for proxy authentication.
     :param platform: Optional Docker platform such as ``linux/amd64``.
     """
 
     server = start_server(
         image_tag=image_tag,
-        operator_key=operator_key,
+        consumer_key=consumer_key,
         persist_key=False,
         platform=platform,
     )
     client: SpawnedProcess | None = None
     operator: SpawnedProcess | None = None
     try:
-        wait_for_text(server, "sshportal server listening on http://0.0.0.0:8080", 30.0)
+        wait_for_text(server, "Bifrost listening on http://0.0.0.0:8080", 30.0)
         wait_for_http(f"http://127.0.0.1:{HOST_PORT}/healthz", 15.0)
 
         client = start_client(
@@ -892,7 +894,7 @@ def run_disconnect_test(*, image_tag: str, operator_key: Path, platform: str | N
         read_available_output(client, 1.0)
 
         wait_for_text(server, "SSH proxy listening on 0.0.0.0:2222", 15.0)
-        operator = start_operator_shell(operator_key)
+        operator = start_operator_shell(consumer_key)
         time.sleep(1.0)
         run_shell_command(operator, "printf 'alive\\n'", "ALIVE", 15.0)
 
@@ -957,23 +959,23 @@ def main() -> int:
     if key_directory.exists():
         shutil.rmtree(key_directory)
     key_directory.mkdir(parents=True)
-    operator_key = generate_operator_key(key_directory)
+    consumer_key = generate_consumer_key(key_directory)
     try:
         run_session(
             image_tag=arguments.image_tag,
             persist_key=False,
-            operator_key=operator_key,
+            consumer_key=consumer_key,
             platform=arguments.platform,
         )
         run_session(
             image_tag=arguments.image_tag,
             persist_key=True,
-            operator_key=operator_key,
+            consumer_key=consumer_key,
             platform=arguments.platform,
         )
         run_disconnect_test(
             image_tag=arguments.image_tag,
-            operator_key=operator_key,
+            consumer_key=consumer_key,
             platform=arguments.platform,
         )
     finally:

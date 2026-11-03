@@ -9,7 +9,7 @@ use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -127,6 +127,7 @@ pub(super) async fn start_ssh_proxy_listener(
                 allowed_public_key: allowed_public_key.clone(),
                 upstream_session: Arc::clone(&upstream_session),
                 channels: Arc::new(AsyncMutex::new(HashMap::new())),
+                cancellation: cancelled.clone(),
             };
             connections.spawn(async move {
                 if let Err(error) =
@@ -148,6 +149,7 @@ pub(super) async fn start_ssh_proxy_listener(
 
 struct ProxiedSessionChannel {
     upstream_writer: Arc<ChannelWriteHalf<client::Msg>>,
+    replies: Arc<AsyncMutex<mpsc::Receiver<bool>>>,
 }
 
 struct LocalSshProxyHandler {
@@ -156,6 +158,7 @@ struct LocalSshProxyHandler {
     allowed_public_key: PublicKey,
     upstream_session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
     channels: Arc<AsyncMutex<HashMap<ChannelId, ProxiedSessionChannel>>>,
+    cancellation: CancellationToken,
 }
 
 impl LocalSshProxyHandler {
@@ -168,6 +171,27 @@ impl LocalSshProxyHandler {
             .get(&channel)
             .map(|state| Arc::clone(&state.upstream_writer))
     }
+    async fn finish_request(&self, channel: ChannelId, session: &mut Session) -> Result<()> {
+        let replies = self
+            .channels
+            .lock()
+            .await
+            .get(&channel)
+            .map(|state| state.replies.clone());
+        let accepted = match replies {
+            Some(replies) => tokio::select! {
+                _ = self.cancellation.cancelled() => false,
+                result = async { replies.lock().await.recv().await } => result.unwrap_or(false),
+            },
+            None => false,
+        };
+        if accepted {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
 }
 
 async fn relay_ssh_session_to_local_client(
@@ -175,6 +199,7 @@ async fn relay_ssh_session_to_local_client(
     mut upstream_reader: ChannelReadHalf,
     local_handle: server::Handle,
     channels: Arc<AsyncMutex<HashMap<ChannelId, ProxiedSessionChannel>>>,
+    replies: mpsc::Sender<bool>,
 ) {
     loop {
         let message = upstream_reader.wait().await;
@@ -190,6 +215,16 @@ async fn relay_ssh_session_to_local_client(
                 match local_handle.extended_data(local_channel, ext, data).await {
                     Ok(()) => {}
                     Err(_) => break,
+                }
+            }
+            ChannelMsg::Success => {
+                if replies.send(true).await.is_err() {
+                    break;
+                }
+            }
+            ChannelMsg::Failure => {
+                if replies.send(false).await.is_err() {
+                    break;
                 }
             }
             ChannelMsg::Eof => {
@@ -223,6 +258,7 @@ async fn relay_ssh_session_to_local_client(
             _ => {}
         }
     }
+    drop(replies);
     let mut guard = channels.lock().await;
     guard.remove(&local_channel);
 }
@@ -286,12 +322,14 @@ impl server::Handler for LocalSshProxyHandler {
         };
         let (upstream_reader, upstream_writer) = upstream_channel.split();
         let upstream_writer = Arc::new(upstream_writer);
+        let (reply_sender, reply_receiver) = mpsc::channel(1);
         {
             let mut guard = self.channels.lock().await;
             guard.insert(
                 local_channel,
                 ProxiedSessionChannel {
                     upstream_writer: Arc::clone(&upstream_writer),
+                    replies: Arc::new(AsyncMutex::new(reply_receiver)),
                 },
             );
         }
@@ -303,6 +341,7 @@ impl server::Handler for LocalSshProxyHandler {
                 upstream_reader,
                 local_handle,
                 channels,
+                reply_sender,
             )
             .await;
         });
@@ -337,8 +376,7 @@ impl server::Handler for LocalSshProxyHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
-        session.channel_success(channel)?;
-        Ok(())
+        self.finish_request(channel, session).await
     }
 
     async fn env_request(
@@ -362,8 +400,7 @@ impl server::Handler for LocalSshProxyHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
-        session.channel_success(channel)?;
-        Ok(())
+        self.finish_request(channel, session).await
     }
 
     async fn shell_request(
@@ -382,8 +419,7 @@ impl server::Handler for LocalSshProxyHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
-        session.channel_success(channel)?;
-        Ok(())
+        self.finish_request(channel, session).await
     }
 
     async fn exec_request(
@@ -403,8 +439,7 @@ impl server::Handler for LocalSshProxyHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
-        session.channel_success(channel)?;
-        Ok(())
+        self.finish_request(channel, session).await
     }
 
     async fn data(

@@ -2,25 +2,23 @@ use std::net::IpAddr;
 
 use anyhow::{Result, bail};
 
-use crate::control::{OfferedSession, VpnScope};
+use crate::NetworkPolicy;
+use crate::control::Capability;
 use crate::network::protocol::{NetworkError, NetworkTarget};
-use crate::vpn::SystemVpnPolicy;
 
 #[derive(Clone, Debug)]
-pub(super) enum ClientNetworkPolicy {
-    DirectEgress,
-    SystemVpn(SystemVpnPolicy),
+pub(super) struct ProviderNetworkPolicy {
+    policy: NetworkPolicy,
 }
 
-impl ClientNetworkPolicy {
-    pub(super) fn from_approved_session(session: &OfferedSession) -> Result<Self> {
-        match session {
-            OfferedSession::Socks {} => Ok(Self::DirectEgress),
-            OfferedSession::Vpn {
-                scope: VpnScope::System { policy },
-            } => Ok(Self::SystemVpn(policy.clone())),
-            OfferedSession::Ssh { .. } => {
-                bail!("an SSH offer cannot start a client network session")
+impl ProviderNetworkPolicy {
+    pub(super) fn from_capability(capability: &Capability) -> Result<Self> {
+        match capability {
+            Capability::Network { policy } => Ok(Self {
+                policy: policy.clone(),
+            }),
+            Capability::Ssh { .. } => {
+                bail!("an SSH capability cannot start a provider network session")
             }
         }
     }
@@ -36,10 +34,7 @@ impl ClientNetworkPolicy {
     }
 
     pub(super) fn allows_resolver_stream(&self) -> bool {
-        match self {
-            Self::DirectEgress => false,
-            Self::SystemVpn(policy) => policy.uses_virtual_dns(),
-        }
+        self.policy.allows_name_resolution()
     }
 
     pub(super) fn authorize_resolver_name(&self, name: &str) -> Result<(), NetworkError> {
@@ -52,10 +47,8 @@ impl ClientNetworkPolicy {
     }
 
     fn allows_target(&self, target: &NetworkTarget) -> bool {
-        let Self::SystemVpn(policy) = self else {
-            return true;
-        };
-        if policy.is_full_tunnel() {
+        let policy = &self.policy;
+        if policy.is_unrestricted() {
             return true;
         }
         match target.host.parse::<IpAddr>() {
@@ -65,52 +58,29 @@ impl ClientNetworkPolicy {
     }
 
     fn allows_resolver_name(&self, name: &str) -> bool {
-        let Self::SystemVpn(policy) = self else {
-            return false;
-        };
-        policy.is_full_tunnel() || policy.matches_domain(name)
+        let policy = &self.policy;
+        policy.is_unrestricted() || policy.matches_domain(name)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ClientNetworkPolicy;
-    use crate::control::{OfferedSession, VpnScope};
+    use super::ProviderNetworkPolicy;
+    use crate::NetworkPolicy;
+    use crate::control::Capability;
     use crate::network::protocol::{NetworkErrorKind, NetworkTarget};
-    use crate::vpn::SystemVpnPolicy;
 
-    fn policy_for(session: OfferedSession) -> ClientNetworkPolicy {
-        ClientNetworkPolicy::from_approved_session(&session).unwrap()
+    fn policy_for(session: Capability) -> ProviderNetworkPolicy {
+        ProviderNetworkPolicy::from_capability(&session).unwrap()
     }
 
-    fn system_policy(policy: SystemVpnPolicy) -> ClientNetworkPolicy {
-        policy_for(OfferedSession::Vpn {
-            scope: VpnScope::System { policy },
-        })
-    }
-
-    #[test]
-    fn socks_allows_egress_but_not_resolver_streams() {
-        let policy = policy_for(OfferedSession::Socks {});
-        for target in [
-            NetworkTarget::new("192.0.2.8", 443).unwrap(),
-            NetworkTarget::new("arbitrary.example", 53).unwrap(),
-        ] {
-            policy.authorize_target(&target).unwrap();
-        }
-        assert!(!policy.allows_resolver_stream());
-        assert_eq!(
-            policy
-                .authorize_resolver_name("arbitrary.example")
-                .unwrap_err()
-                .kind,
-            NetworkErrorKind::PermissionDenied
-        );
+    fn system_policy(policy: NetworkPolicy) -> ProviderNetworkPolicy {
+        policy_for(Capability::Network { policy })
     }
 
     #[test]
     fn full_system_vpn_allows_every_target_and_resolver_name() {
-        let policy = system_policy(SystemVpnPolicy::full_tunnel());
+        let policy = system_policy(NetworkPolicy::unrestricted());
 
         for target in [
             NetworkTarget::new("192.0.2.8", 443).unwrap(),
@@ -125,7 +95,7 @@ mod tests {
     #[test]
     fn selective_system_vpn_enforces_address_and_domain_selectors_by_target_kind() {
         let policy = system_policy(
-            SystemVpnPolicy::new(
+            NetworkPolicy::new(
                 vec![
                     "10.20.0.0/16".parse().unwrap(),
                     "2001:db8:20::/48".parse().unwrap(),
@@ -167,7 +137,7 @@ mod tests {
     #[test]
     fn cidr_only_system_vpn_rejects_resolver_streams_and_names() {
         let policy = system_policy(
-            SystemVpnPolicy::new(vec!["10.20.0.0/16".parse().unwrap()], Vec::new()).unwrap(),
+            NetworkPolicy::new(vec!["10.20.0.0/16".parse().unwrap()], Vec::new()).unwrap(),
         );
 
         assert_eq!(
@@ -190,7 +160,7 @@ mod tests {
     #[test]
     fn domain_only_system_vpn_rejects_direct_ip_targets() {
         let policy = system_policy(
-            SystemVpnPolicy::new(Vec::new(), vec!["allowed.example".to_string()]).unwrap(),
+            NetworkPolicy::new(Vec::new(), vec!["allowed.example".to_string()]).unwrap(),
         );
 
         assert_eq!(
@@ -205,7 +175,7 @@ mod tests {
     #[test]
     fn ssh_offer_cannot_construct_a_network_policy() {
         assert!(
-            ClientNetworkPolicy::from_approved_session(&OfferedSession::Ssh {
+            ProviderNetworkPolicy::from_capability(&Capability::Ssh {
                 ssh_public_key: "unused".to_string(),
                 persist_key_requested: false,
             })

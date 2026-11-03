@@ -657,7 +657,7 @@ async fn rejected_session_requests_preserve_the_channel_state() {
         for with_pty in [false, true] {
             let mut channel = session.channel_open_session().await.unwrap();
             channel
-                .set_env(true, "SSHPORTAL_TEST_MARKER", "pending-channel-preserved")
+                .set_env(true, "BIFROST_TEST_MARKER", "pending-channel-preserved")
                 .await
                 .unwrap();
             assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
@@ -676,8 +676,8 @@ async fn rejected_session_requests_preserve_the_channel_state() {
             }
             assert!(matches!(channel.wait().await, Some(ChannelMsg::Failure)));
             let command = match shell.family() {
-                ShellFamily::Posix => "printf '%s\\n' \"$SSHPORTAL_TEST_MARKER\"",
-                ShellFamily::PowerShell => "Write-Output $env:SSHPORTAL_TEST_MARKER",
+                ShellFamily::Posix => "printf '%s\\n' \"$BIFROST_TEST_MARKER\"",
+                ShellFamily::PowerShell => "Write-Output $env:BIFROST_TEST_MARKER",
             };
             let (stdout, stderr, status) = collect_exec_output(&mut channel, command).await;
             assert_eq!(status, 0, "{stderr}");

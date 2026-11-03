@@ -4,11 +4,9 @@
 //! session therefore remains a stable reverse lookup until the entire map is dropped.
 
 mod mapping;
-mod name;
 mod protocol;
 mod synthesis;
 
 pub use mapping::{Ipv4Pool, Ipv6Pool, SyntheticAddressMap};
-pub(crate) use name::DnsName;
 pub use protocol::{DnsQuery, ResponseCode};
 pub use synthesis::{Resolution, synthesize_response};

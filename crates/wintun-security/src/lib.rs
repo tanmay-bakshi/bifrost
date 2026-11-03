@@ -52,7 +52,7 @@ use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 
-const CACHE_DIRECTORY_NAME: &str = "SSHPortal";
+const CACHE_DIRECTORY_NAME: &str = "Bifrost";
 const EXPECTED_PUBLISHER: &str = "WireGuard LLC";
 const SECURITY_DESCRIPTOR: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn failed_staging_closes_the_writer_before_removing_the_image() {
         let path = std::env::temp_dir().join(format!(
-            "sshportal-staging-{:032x}.dll",
+            "bifrost-staging-{:032x}.dll",
             rand::random::<u128>()
         ));
         let result = (|| -> anyhow::Result<()> {
@@ -751,18 +751,18 @@ mod tests {
             .lock()
             .expect("cache test lock was poisoned");
         let fixture = PathBuf::from(
-            std::env::var_os("SSHPORTAL_REJECTED_WINTUN_DLL")
-                .expect("SSHPORTAL_REJECTED_WINTUN_DLL must name the compiled regression fixture"),
+            std::env::var_os("BIFROST_REJECTED_WINTUN_DLL")
+                .expect("BIFROST_REJECTED_WINTUN_DLL must name the compiled regression fixture"),
         );
         let marker = PathBuf::from(
-            std::env::var_os("SSHPORTAL_REJECTED_WINTUN_MARKER")
-                .expect("SSHPORTAL_REJECTED_WINTUN_MARKER must name the DllMain marker"),
+            std::env::var_os("BIFROST_REJECTED_WINTUN_MARKER")
+                .expect("BIFROST_REJECTED_WINTUN_MARKER must name the DllMain marker"),
         );
         let executable = std::env::current_exe().expect("failed to locate the test executable");
         let application_directory = executable
             .parent()
             .expect("the test executable has no containing directory");
-        let probe_path = application_directory.join("sshportal-dll-search-probe.dll");
+        let probe_path = application_directory.join("bifrost-dll-search-probe.dll");
         if marker.exists() {
             std::fs::remove_file(&marker).expect("failed to remove stale DllMain marker");
         }
@@ -774,7 +774,7 @@ mod tests {
 
         restrict_process_dll_search_to_system32()
             .expect("failed to restrict default DLL resolution");
-        let encoded = wide("sshportal-dll-search-probe.dll");
+        let encoded = wide("bifrost-dll-search-probe.dll");
         let module = unsafe { LoadLibraryW(encoded.as_ptr()) };
         if !module.is_null() {
             unsafe {
@@ -799,12 +799,12 @@ mod tests {
             .lock()
             .expect("cache test lock was poisoned");
         let fixture = PathBuf::from(
-            std::env::var_os("SSHPORTAL_REJECTED_WINTUN_DLL")
-                .expect("SSHPORTAL_REJECTED_WINTUN_DLL must name the compiled regression fixture"),
+            std::env::var_os("BIFROST_REJECTED_WINTUN_DLL")
+                .expect("BIFROST_REJECTED_WINTUN_DLL must name the compiled regression fixture"),
         );
         let marker = PathBuf::from(
-            std::env::var_os("SSHPORTAL_REJECTED_WINTUN_MARKER")
-                .expect("SSHPORTAL_REJECTED_WINTUN_MARKER must name the DllMain marker"),
+            std::env::var_os("BIFROST_REJECTED_WINTUN_MARKER")
+                .expect("BIFROST_REJECTED_WINTUN_MARKER must name the DllMain marker"),
         );
         if marker.exists() {
             std::fs::remove_file(&marker).expect("failed to remove stale DllMain marker");
@@ -826,8 +826,8 @@ mod tests {
             .lock()
             .expect("cache test lock was poisoned");
         let trusted = PathBuf::from(
-            std::env::var_os("SSHPORTAL_TRUSTED_WINTUN_DLL")
-                .expect("SSHPORTAL_TRUSTED_WINTUN_DLL must name the bundled Wintun DLL"),
+            std::env::var_os("BIFROST_TRUSTED_WINTUN_DLL")
+                .expect("BIFROST_TRUSTED_WINTUN_DLL must name the bundled Wintun DLL"),
         );
         let verified = VerifiedWintun::prepare(&trusted).expect("trusted Wintun was rejected");
         let cached_path = verified.path().to_path_buf();

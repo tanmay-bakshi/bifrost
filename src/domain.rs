@@ -9,7 +9,7 @@ pub struct DnsName {
     labels: Vec<Vec<u8>>,
 }
 
-pub(super) struct DnsNameBuilder {
+pub(crate) struct DnsNameBuilder {
     labels: Vec<Vec<u8>>,
     wire_len: usize,
 }
@@ -121,21 +121,21 @@ impl DnsName {
 }
 
 impl DnsNameBuilder {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             labels: Vec::new(),
             wire_len: 1,
         }
     }
 
-    pub(super) fn push_label(&mut self, label: &[u8]) -> Result<(), NameError> {
+    pub(crate) fn push_label(&mut self, label: &[u8]) -> Result<(), NameError> {
         self.validate_label(label)?;
         self.labels.push(label.to_vec());
         self.wire_len += label.len() + 1;
         Ok(())
     }
 
-    pub(super) fn finish(self) -> DnsName {
+    pub(crate) fn finish(self) -> DnsName {
         DnsName {
             labels: self.labels,
         }

@@ -23,7 +23,7 @@ use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder}
 use crate::debug::debug_log;
 
 use super::configuration::{SyntheticNetworkConfiguration, VpnNetworkConfiguration};
-use super::policy::SystemVpnPolicy;
+use crate::NetworkPolicy;
 
 const JOURNAL_VERSION: u8 = 2;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
@@ -171,8 +171,8 @@ enum DnsMatchDomains {
 }
 
 impl RoutePlan {
-    fn for_policy(policy: &SystemVpnPolicy, network: VpnNetworkConfiguration) -> Result<Self> {
-        if policy.is_full_tunnel() {
+    fn for_policy(policy: &NetworkPolicy, network: VpnNetworkConfiguration) -> Result<Self> {
+        if policy.is_unrestricted() {
             let synthetic = require_synthetic(network.synthetic)?;
             return Ok(Self {
                 tunnel_prefixes: SPLIT_DEFAULT_ROUTES.to_vec(),
@@ -211,7 +211,7 @@ impl RoutePlan {
         Ok(Self {
             tunnel_prefixes,
             dns,
-            requires_ipv6: policy.requires_ipv6_tunnel(),
+            requires_ipv6: policy.allows_ipv6(),
         })
     }
 
@@ -261,7 +261,7 @@ pub(super) struct PreparedHostNetwork<E: CommandExecutor = SystemCommandExecutor
     executor: E,
     platform: Platform,
     journal_store: JournalStore,
-    policy: SystemVpnPolicy,
+    policy: NetworkPolicy,
     network: VpnNetworkConfiguration,
 }
 
@@ -368,7 +368,7 @@ pub(super) enum AddressSelection {
 }
 
 pub(super) fn prepare(
-    policy: &SystemVpnPolicy,
+    policy: &NetworkPolicy,
     selection: AddressSelection,
     transport_peer: IpAddr,
 ) -> Result<PreparedHostNetwork> {
@@ -383,7 +383,7 @@ pub(super) fn prepare(
 }
 
 fn prepare_with<E: CommandExecutor>(
-    policy: &SystemVpnPolicy,
+    policy: &NetworkPolicy,
     selection: AddressSelection,
     transport_peer: IpAddr,
     platform: Platform,
@@ -406,9 +406,11 @@ fn prepare_with<E: CommandExecutor>(
         )?],
     );
     let network = match selection {
-        AddressSelection::Fresh(entropy) => {
-            VpnNetworkConfiguration::select(&address_conflicts, entropy, policy.uses_virtual_dns())?
-        }
+        AddressSelection::Fresh(entropy) => VpnNetworkConfiguration::select(
+            &address_conflicts,
+            entropy,
+            policy.allows_name_resolution(),
+        )?,
         AddressSelection::Retained(network) => {
             network.validate_available(&address_conflicts)?;
             network
@@ -1500,7 +1502,7 @@ fn windows_nrpt_ensure_command(session_id: [u8; 16], dns: &DnsPlan) -> CommandSp
                  Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction Stop \
              }}; \
              Add-DnsClientNrptRule -Namespace $namespaces -NameServers $servers \
-                 -DisplayName $displayName -Comment 'SSHPortal VPN DNS policy' \
+                 -DisplayName $displayName -Comment 'Bifrost VPN DNS policy' \
                  -ErrorAction Stop | Out-Null; \
              Clear-DnsClientCache -ErrorAction Stop \
          }}"
@@ -3319,7 +3321,7 @@ impl JournalStore {
     fn production() -> Result<Self> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return Ok(Self {
-            path: PathBuf::from("/var/run/sshportal/network-state.jsonl"),
+            path: PathBuf::from("/var/run/bifrost/network-state.jsonl"),
             owner_uid: 0,
         });
         #[cfg(target_os = "windows")]
@@ -3334,7 +3336,7 @@ impl JournalStore {
             }
             Ok(Self {
                 path: PathBuf::from(program_data)
-                    .join("SSHPortal")
+                    .join("Bifrost")
                     .join("network-state.jsonl"),
             })
         }
@@ -3711,7 +3713,7 @@ fn recover_stale_journal<E: CommandExecutor>(
         == Some(journal.header.owner_identity.as_str())
     {
         bail!(
-            "another sshportal VPN session (process {}) still owns the host-network state",
+            "another bifrost VPN session (process {}) still owns the host-network state",
             journal.header.owner_pid
         );
     }
@@ -3833,7 +3835,7 @@ fn session_name(session_id: [u8; 16]) -> String {
         use std::fmt::Write as _;
         write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    format!("SSHPortal-{encoded}")
+    format!("Bifrost-{encoded}")
 }
 
 #[cfg(target_os = "macos")]
@@ -3913,7 +3915,7 @@ fn macos_dns_dictionary(interface: &str, dns: &DnsPlan) -> CFDictionary<CFString
 #[cfg(target_os = "macos")]
 fn cleanup_macos_dns(session_id: [u8; 16]) -> Result<()> {
     let session_name = session_name(session_id);
-    let store = SCDynamicStoreBuilder::new("SSHPortal recovery")
+    let store = SCDynamicStoreBuilder::new("Bifrost recovery")
         .build()
         .context("failed to open macOS SystemConfiguration for VPN DNS cleanup")?;
     let key = format!("State:/Network/Service/{session_name}/DNS");
@@ -4132,9 +4134,9 @@ mod tests {
     }
 
     #[test]
-    fn full_tunnel_forces_dns_through_runtime_synthetic_servers() {
+    fn unrestricted_forces_dns_through_runtime_synthetic_servers() {
         let network = selected_network(true);
-        let plan = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network).unwrap();
+        let plan = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network).unwrap();
         let dns = plan.dns.unwrap();
 
         assert_eq!(plan.tunnel_prefixes, SPLIT_DEFAULT_ROUTES);
@@ -4144,7 +4146,7 @@ mod tests {
 
     #[test]
     fn cidr_only_plan_neither_claims_synthetic_routes_nor_changes_dns() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             vec![
                 "10.20.0.0/16".parse().unwrap(),
                 "2001:db8:7::/48".parse().unwrap(),
@@ -4166,7 +4168,7 @@ mod tests {
 
     #[test]
     fn domain_plan_routes_both_runtime_synthetic_pools_and_scopes_dns() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             Vec::new(),
             vec!["anthem.com".to_string(), "elevancehealth.com".to_string()],
         )
@@ -4186,7 +4188,7 @@ mod tests {
 
     #[test]
     fn resume_retains_vpn_address_ranges_and_refuses_new_collisions() {
-        let policy = SystemVpnPolicy::full_tunnel();
+        let policy = NetworkPolicy::unrestricted();
         let network = selected_network(true);
         let temp = TempDir::new().unwrap();
         let prepared = prepare_with(
@@ -4219,7 +4221,7 @@ mod tests {
         let entropy = [29; 16];
         let baseline = VpnNetworkConfiguration::select(&[], entropy, true).unwrap();
         let baseline_synthetic = baseline.synthetic.unwrap();
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             vec![
                 IpNet::V4(baseline.point_to_point_ipv4),
                 IpNet::V4(baseline_synthetic.ipv4),
@@ -4250,7 +4252,7 @@ mod tests {
     fn websocket_peer_addresses_are_reserved_from_ipv4_and_ipv6_session_pools() {
         let entropy = [31; 16];
         let baseline = VpnNetworkConfiguration::select(&[], entropy, true).unwrap();
-        let policy = SystemVpnPolicy::new(Vec::new(), vec!["example.com".to_string()]).unwrap();
+        let policy = NetworkPolicy::new(Vec::new(), vec!["example.com".to_string()]).unwrap();
 
         let ipv4_temp = TempDir::new().unwrap();
         let ipv4 = prepare_with(
@@ -5404,9 +5406,9 @@ mod tests {
     #[test]
     fn windows_plan_uses_runtime_gateways_and_session_scoped_root_nrpt() {
         let network = selected_network(true);
-        let plan = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network).unwrap();
+        let plan = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network).unwrap();
         let tunnel = TunnelIdentity {
-            name: "sshportal".to_string(),
+            name: "bifrost".to_string(),
             index: 14,
         };
         let resources = static_resources(Platform::Windows, &tunnel, network, &plan);
@@ -5438,13 +5440,13 @@ mod tests {
         let script = command.arguments.last().unwrap();
         assert!(script.contains("$namespaces = @('.')"));
         assert!(script.contains(&network.synthetic.unwrap().ipv4_dns.to_string()));
-        assert!(script.contains("SSHPortal-09090909090909090909090909090909"));
+        assert!(script.contains("Bifrost-09090909090909090909090909090909"));
     }
 
     #[test]
     fn linux_full_dns_plan_uses_route_only_root_domain_and_both_servers() {
         let network = selected_network(true);
-        let dns = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network)
+        let dns = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network)
             .unwrap()
             .dns
             .unwrap();
@@ -5969,7 +5971,7 @@ mod tests {
     #[cfg_attr(not(target_os = "windows"), ignore = "requires pwsh on PATH")]
     fn windows_powershell_stops_when_a_command_cannot_be_resolved() {
         let mut command = powershell(
-            "Get-SSHPortalMissingCommand; [Console]::Out.Write('continued after failure')",
+            "Get-BifrostMissingCommand; [Console]::Out.Write('continued after failure')",
         );
         if !cfg!(target_os = "windows") {
             command.program = "pwsh".to_string();
@@ -6114,7 +6116,7 @@ mod tests {
     #[test]
     fn linux_command_plan_uses_runtime_interface_gateway_and_synthetic_addresses() {
         let network = selected_network(true);
-        let plan = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network).unwrap();
+        let plan = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network).unwrap();
         let tunnel = TunnelIdentity {
             name: "tun42".to_string(),
             index: 42,
@@ -6160,7 +6162,7 @@ mod tests {
     #[test]
     fn macos_command_plan_uses_runtime_interface_and_session_dns_identity() {
         let network = selected_network(true);
-        let plan = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network).unwrap();
+        let plan = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network).unwrap();
         let tunnel = TunnelIdentity {
             name: "utun42".to_string(),
             index: 42,
@@ -6238,7 +6240,7 @@ mod tests {
         )
         .unwrap();
         let script = windows.calls()[0].arguments.last().unwrap().clone();
-        assert!(script.contains("$_.DisplayName -eq 'SSHPortal-06060606060606060606060606060606'"));
+        assert!(script.contains("$_.DisplayName -eq 'Bifrost-06060606060606060606060606060606'"));
         assert!(script.contains("Remove-DnsClientNrptRule"));
         assert!(script.contains("Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction Stop"));
     }
@@ -6264,9 +6266,9 @@ mod tests {
     #[test]
     fn windows_command_plan_uses_runtime_interface_and_gateway() {
         let network = selected_network(true);
-        let plan = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network).unwrap();
+        let plan = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network).unwrap();
         let tunnel = TunnelIdentity {
-            name: "sshportal".to_string(),
+            name: "bifrost".to_string(),
             index: 42,
         };
         let resources = static_resources(Platform::Windows, &tunnel, network, &plan);
@@ -6299,7 +6301,7 @@ mod tests {
     #[test]
     fn macos_full_dns_uses_empty_match_domain_and_both_runtime_servers() {
         let network = selected_network(true);
-        let dns = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network)
+        let dns = RoutePlan::for_policy(&NetworkPolicy::unrestricted(), network)
             .unwrap()
             .dns
             .unwrap();

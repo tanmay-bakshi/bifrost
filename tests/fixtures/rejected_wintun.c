@@ -9,7 +9,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 
     WCHAR marker[MAX_PATH];
     DWORD length = GetEnvironmentVariableW(
-        L"SSHPORTAL_REJECTED_WINTUN_MARKER",
+        L"BIFROST_REJECTED_WINTUN_MARKER",
         marker,
         MAX_PATH
     );

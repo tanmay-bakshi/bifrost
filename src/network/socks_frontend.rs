@@ -14,8 +14,8 @@ use crate::NETWORK_SESSION_FLOW_LIMIT;
 use crate::debug::debug_log;
 use crate::network::protocol::{NetworkError, NetworkErrorKind};
 use crate::network::session::{
-    NetworkSessionRuntime, OperatorNetworkSession, ReceivedUdpDatagram, bridge_operator_tcp,
-    start_operator_network_session,
+    ConsumerNetworkSession, ReceivedUdpDatagram, bridge_consumer_tcp,
+    start_consumer_network_session,
 };
 use crate::socks::{
     SOCKS_REPLY_CONNECTION_NOT_ALLOWED, SOCKS_REPLY_CONNECTION_REFUSED,
@@ -24,6 +24,7 @@ use crate::socks::{
     decode_socks_udp_datagram, encode_socks_udp_datagram, negotiate_socks5_network,
     write_socks5_response,
 };
+use tokio_util::sync::CancellationToken;
 
 const SOCKS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SOCKS_UDP_PACKET_BYTES: usize = 65_535;
@@ -72,40 +73,44 @@ struct SocksUdpWorkerCompletion {
     result: Result<(), NetworkError>,
 }
 
-pub async fn run_operator_socks_proxy<S>(
+pub async fn run_consumer_socks_proxy<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
     listener: Arc<TcpListener>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let bound_addr = listener
-        .local_addr()
-        .context("failed to read SOCKS5 proxy listener address")?;
-    println!("SOCKS5 proxy listening on {bound_addr} (SSH disabled)");
-    run_operator_network_proxy_with_listener(websocket, listener).await
+    run_network_proxy_with_listener(websocket, listener).await
 }
 
-async fn run_operator_network_proxy_with_listener<S>(
+async fn run_network_proxy_with_listener<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
     listener: Arc<TcpListener>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (session, runtime) = start_operator_network_session(websocket).await?;
-    run_socks_listener(session, runtime, listener).await
+    let (session, runtime) = start_consumer_network_session(websocket).await?;
+    crate::network::run_network_epoch(
+        session,
+        runtime,
+        CancellationToken::new(),
+        |session, shutdown| run_socks_listener(session, listener, shutdown),
+    )
+    .await
 }
 
-async fn run_socks_listener(
-    session: OperatorNetworkSession,
-    runtime: NetworkSessionRuntime,
+pub(crate) async fn run_socks_listener(
+    session: ConsumerNetworkSession,
     listener: Arc<TcpListener>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let mut flows = JoinSet::new();
+    println!(
+        "SOCKS5 proxy listening on {} (SSH disabled)",
+        listener.local_addr()?
+    );
     let session_result = {
-        let runtime = runtime.wait();
-        tokio::pin!(runtime);
         loop {
             tokio::select! {
                 accepted = listener.accept(), if flows.len() < NETWORK_SESSION_FLOW_LIMIT => {
@@ -123,7 +128,7 @@ async fn run_socks_listener(
                         }
                     });
                 }
-                result = &mut runtime => break result,
+                _ = shutdown.cancelled() => break Ok(()),
                 result = flows.join_next(), if !flows.is_empty() => {
                     if let Some(Err(error)) = result {
                         break Err(error).context("SOCKS flow task failed to join");
@@ -138,7 +143,7 @@ async fn run_socks_listener(
     session_result
 }
 
-async fn run_socks_flow(mut stream: TcpStream, session: OperatorNetworkSession) -> Result<()> {
+async fn run_socks_flow(mut stream: TcpStream, session: ConsumerNetworkSession) -> Result<()> {
     let request = match tokio::time::timeout(
         SOCKS_NEGOTIATION_TIMEOUT,
         negotiate_socks5_network(&mut stream),
@@ -160,7 +165,7 @@ async fn run_socks_flow(mut stream: TcpStream, session: OperatorNetworkSession) 
 
 async fn run_socks_tcp(
     mut stream: TcpStream,
-    session: OperatorNetworkSession,
+    session: ConsumerNetworkSession,
     target: crate::network::NetworkTarget,
 ) -> Result<()> {
     let tunnel = match session.connect_tcp(target).await {
@@ -171,10 +176,10 @@ async fn run_socks_tcp(
         }
     };
     write_socks5_response(&mut stream, SOCKS_REPLY_SUCCESS, None).await?;
-    bridge_operator_tcp(stream, tunnel).await
+    bridge_consumer_tcp(stream, tunnel).await
 }
 
-async fn run_socks_udp(mut control: TcpStream, session: OperatorNetworkSession) -> Result<()> {
+async fn run_socks_udp(mut control: TcpStream, session: ConsumerNetworkSession) -> Result<()> {
     let bind_address = match control.local_addr()?.ip() {
         IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(address) if address.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -293,7 +298,7 @@ async fn run_socks_udp(mut control: TcpStream, session: OperatorNetworkSession) 
 
 fn queue_socks_udp_datagram(
     datagram: SocksUdpDatagram,
-    session: &OperatorNetworkSession,
+    session: &ConsumerNetworkSession,
     targets: &mut HashMap<crate::network::NetworkTarget, SocksUdpTarget>,
     workers: &mut JoinSet<SocksUdpWorkerCompletion>,
     events: &mpsc::Sender<SocksUdpEvent>,
@@ -370,7 +375,7 @@ fn queue_socks_udp_datagram(
 }
 
 async fn run_socks_udp_target(
-    session: OperatorNetworkSession,
+    session: ConsumerNetworkSession,
     target: crate::network::NetworkTarget,
     generation: u64,
     requests: mpsc::Receiver<BufferedSocksUdpDatagram>,
@@ -385,7 +390,7 @@ async fn run_socks_udp_target(
 }
 
 async fn run_socks_udp_target_inner(
-    session: &OperatorNetworkSession,
+    session: &ConsumerNetworkSession,
     target: &crate::network::NetworkTarget,
     generation: u64,
     requests: mpsc::Receiver<BufferedSocksUdpDatagram>,
@@ -600,10 +605,10 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 
+    use crate::Capability;
     use crate::NETWORK_SESSION_FLOW_LIMIT;
-    use crate::OfferedSession;
     use crate::network::NetworkTarget;
-    use crate::network::session::run_client_network_session;
+    use crate::network::session::run_provider_network_session;
     use crate::socks::{
         SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_ATYP_IPV6, SOCKS_AUTH_NONE,
         SOCKS_CMD_CONNECT, SOCKS_CMD_UDP_ASSOCIATE, SOCKS_REPLY_SUCCESS, SOCKS_VERSION,
@@ -613,8 +618,7 @@ mod tests {
 
     use super::{
         MAX_SOCKS_UDP_PACKET_BYTES, MAX_SOCKS_UDP_QUEUED_DATAGRAMS_PER_TARGET,
-        next_udp_target_expiry, run_operator_network_proxy_with_listener,
-        wait_for_udp_target_expiry,
+        next_udp_target_expiry, run_network_proxy_with_listener, wait_for_udp_target_expiry,
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -649,10 +653,16 @@ mod tests {
         let client_websocket =
             WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
         let client_task = tokio::spawn(async move {
-            run_client_network_session(client_websocket, OfferedSession::Socks {}).await
+            run_provider_network_session(
+                client_websocket,
+                Capability::Network {
+                    policy: crate::NetworkPolicy::unrestricted(),
+                },
+            )
+            .await
         });
         let operator_task = tokio::spawn(async move {
-            run_operator_network_proxy_with_listener(operator_websocket, Arc::new(listener)).await
+            run_network_proxy_with_listener(operator_websocket, Arc::new(listener)).await
         });
         NetworkProxyHarness {
             socks_address,

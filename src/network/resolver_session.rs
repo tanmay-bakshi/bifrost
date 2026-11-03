@@ -7,8 +7,8 @@ use h2::{Reason, RecvStream, SendStream};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 
-use crate::network::client_resolver::ClientResolver;
-use crate::network::policy::ClientNetworkPolicy;
+use crate::network::backend::NetworkBackend;
+use crate::network::policy::ProviderNetworkPolicy;
 use crate::network::protocol::{NetworkError, NetworkErrorKind};
 use crate::network::resolver_protocol::{
     MAX_RESOLVER_REQUEST_BODY_BYTES, MAX_RESOLVER_RESPONSE_BODY_BYTES, RESOLVER_CONTENT_TYPE,
@@ -17,17 +17,17 @@ use crate::network::resolver_protocol::{
     encode_resolve_request,
 };
 use crate::network::session::{
-    OperatorNetworkSession, map_h2_error, map_session_error, send_h2_data,
+    ConsumerNetworkSession, map_h2_error, map_session_error, send_h2_data,
 };
 
 pub(super) const MAX_CONCURRENT_RESOLVER_REQUESTS: usize =
-    crate::network::client_resolver::MAX_CONCURRENT_NATIVE_RESOLVER_LOOKUPS;
+    crate::network::resolver::MAX_CONCURRENT_NATIVE_RESOLVER_LOOKUPS;
 
 const RESOLVER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOLVER_RESPONSE_GRACE: Duration = Duration::from_secs(1);
 const RESPONSE_CODE_SERVER_FAILURE: u8 = 2;
 
-impl OperatorNetworkSession {
+impl ConsumerNetworkSession {
     pub(super) fn acquire_resolver_permit(
         &self,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, NetworkError> {
@@ -121,15 +121,16 @@ pub(super) fn is_resolver_request<B>(request: &Request<B>) -> bool {
     request.method() == Method::POST
 }
 
-pub(super) async fn handle_client_resolver_request(
+pub(super) async fn handle_resolver_request(
     request: Request<RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
-    resolver: Arc<ClientResolver>,
-    policy: Arc<ClientNetworkPolicy>,
+    resolver: Arc<NetworkBackend>,
+    policy: Arc<ProviderNetworkPolicy>,
 ) -> Result<()> {
     if !policy.allows_resolver_stream() {
-        let error =
-            NetworkError::policy_denied("approved session does not permit client resolver streams");
+        let error = NetworkError::policy_denied(
+            "approved session does not permit provider resolver streams",
+        );
         return reject_forbidden_resolver_stream(request, respond, error).await;
     }
     let expected_length = match validate_resolver_request_head(&request) {
@@ -187,8 +188,8 @@ pub(super) async fn handle_client_resolver_request(
             outcome.unwrap_or_else(|_| server_failure())
         }
     };
-    let encoded =
-        encode_resolve_outcome(&outcome).context("client resolver produced an invalid outcome")?;
+    let encoded = encode_resolve_outcome(&outcome)
+        .context("provider resolver produced an invalid outcome")?;
     let response = Response::builder()
         .status(StatusCode::OK)
         .version(Version::HTTP_2)
@@ -412,7 +413,7 @@ pub(super) fn reject_resolver_capacity(respond: h2::server::SendResponse<Bytes>)
     reject_resolver_request(
         respond,
         StatusCode::SERVICE_UNAVAILABLE,
-        NetworkError::resource_limit("client resolver request limit reached"),
+        NetworkError::resource_limit("provider resolver request limit reached"),
     )
 }
 
@@ -487,20 +488,18 @@ mod tests {
     use super::{
         MAX_CONCURRENT_RESOLVER_REQUESTS, RESOLVER_CONTENT_TYPE, RESOLVER_REQUEST_AUTHORITY,
         RESOLVER_REQUEST_PATH, ResolveOutcome, ResolveRequest, encode_resolve_outcome,
-        encode_resolve_request, handle_client_resolver_request, resolver_uri,
+        encode_resolve_request, handle_resolver_request, resolver_uri,
     };
-    use crate::network::client_resolver::ClientResolver;
-    use crate::network::policy::ClientNetworkPolicy;
+    use crate::network::backend::NetworkBackend;
+    use crate::network::policy::ProviderNetworkPolicy;
     use crate::network::protocol::{NetworkErrorKind, NetworkTarget, ResolutionFamily};
-    use crate::network::session::OperatorNetworkSession;
-    use crate::{OfferedSession, SystemVpnPolicy, VpnScope};
+    use crate::network::session::ConsumerNetworkSession;
+    use crate::{Capability, NetworkPolicy};
 
-    fn full_system_vpn_policy() -> Arc<ClientNetworkPolicy> {
+    fn full_system_vpn_policy() -> Arc<ProviderNetworkPolicy> {
         Arc::new(
-            ClientNetworkPolicy::from_approved_session(&OfferedSession::Vpn {
-                scope: VpnScope::System {
-                    policy: SystemVpnPolicy::full_tunnel(),
-                },
+            ProviderNetworkPolicy::from_capability(&Capability::Network {
+                policy: NetworkPolicy::unrestricted(),
             })
             .unwrap(),
         )
@@ -510,7 +509,7 @@ mod tests {
         flow_limit: usize,
         resolver_limit: usize,
     ) -> Result<(
-        OperatorNetworkSession,
+        ConsumerNetworkSession,
         mpsc::UnboundedReceiver<(Request<h2::RecvStream>, h2::server::SendResponse<Bytes>)>,
         tokio::task::JoinHandle<Result<()>>,
         tokio::task::JoinHandle<Result<()>>,
@@ -539,7 +538,7 @@ mod tests {
             Ok(())
         });
         Ok((
-            OperatorNetworkSession::from_test_transport(requests, flow_limit, resolver_limit),
+            ConsumerNetworkSession::from_test_transport(requests, flow_limit, resolver_limit),
             requests_rx,
             operator_task,
             client_task,
@@ -712,14 +711,9 @@ mod tests {
                 let (request, respond) = request?;
                 let policy = Arc::clone(&policy);
                 tokio::spawn(async move {
-                    handle_client_resolver_request(
-                        request,
-                        respond,
-                        Arc::new(ClientResolver::from_system_configuration()),
-                        policy,
-                    )
-                    .await
-                    .unwrap();
+                    handle_resolver_request(request, respond, NetworkBackend::local(), policy)
+                        .await
+                        .unwrap();
                 });
             }
             Ok(())

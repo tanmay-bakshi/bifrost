@@ -32,6 +32,6 @@ fi
 resolvectl dns "${physical_interface}" "${physical_dns}"
 resolvectl default-route "${physical_interface}" true
 printf 'nameserver 127.0.0.53\noptions edns0 trust-ad\n' > /etc/resolv.conf
-touch /run/sshportal-vpn-e2e-ready
+touch /run/bifrost-vpn-e2e-ready
 
 exec "$@"

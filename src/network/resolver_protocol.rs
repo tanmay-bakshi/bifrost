@@ -1,9 +1,9 @@
 use std::fmt;
 
 pub(crate) const RESOLVER_REQUEST_SCHEME: &str = "https";
-pub(crate) const RESOLVER_REQUEST_AUTHORITY: &str = "client.sshportal.invalid";
-pub(crate) const RESOLVER_REQUEST_PATH: &str = "/.well-known/sshportal/network/resolve";
-pub(crate) const RESOLVER_CONTENT_TYPE: &str = "application/vnd.sshportal.resolver.v1";
+pub(crate) const RESOLVER_REQUEST_AUTHORITY: &str = "provider.bifrost.invalid";
+pub(crate) const RESOLVER_REQUEST_PATH: &str = "/.well-known/bifrost/network/resolve";
+pub(crate) const RESOLVER_CONTENT_TYPE: &str = "application/vnd.bifrost.resolver.v1";
 
 pub(crate) const MAX_RESOLVER_REQUEST_BODY_BYTES: usize = 267;
 pub(crate) const MAX_RESOLVER_RESPONSE_BODY_BYTES: usize = 8;
@@ -528,15 +528,12 @@ mod tests {
     #[test]
     fn h2_endpoint_identity_is_explicit_and_versioned() {
         assert_eq!(RESOLVER_REQUEST_SCHEME, "https");
-        assert_eq!(RESOLVER_REQUEST_AUTHORITY, "client.sshportal.invalid");
+        assert_eq!(RESOLVER_REQUEST_AUTHORITY, "provider.bifrost.invalid");
         assert_eq!(
             RESOLVER_REQUEST_PATH,
-            "/.well-known/sshportal/network/resolve"
+            "/.well-known/bifrost/network/resolve"
         );
-        assert_eq!(
-            RESOLVER_CONTENT_TYPE,
-            "application/vnd.sshportal.resolver.v1"
-        );
+        assert_eq!(RESOLVER_CONTENT_TYPE, "application/vnd.bifrost.resolver.v1");
     }
 
     #[test]

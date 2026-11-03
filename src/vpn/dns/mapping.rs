@@ -3,7 +3,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use super::name::DnsName;
+use crate::domain::DnsName;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressFamily {
@@ -285,11 +285,11 @@ impl fmt::Display for AddressFamily {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use super::super::name::DnsName;
     use super::{
         AddressFamily, Ipv4Pool, Ipv6Pool, MappingError, PoolConfigurationError,
         SyntheticAddressMap,
     };
+    use crate::domain::DnsName;
 
     fn map(maximum_allocations: usize) -> SyntheticAddressMap {
         let ipv4 = Ipv4Pool::new(

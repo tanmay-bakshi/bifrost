@@ -47,13 +47,13 @@ impl SystemTun {
         configuration.platform_config(|platform| {
             // A kernel-control utun always carries a four-byte address-family
             // header. `tun` removes and restores it when this is enabled, so
-            // the rest of SSHPortal sees the same raw-IP contract on every OS.
+            // the rest of Bifrost sees the same raw-IP contract on every OS.
             platform.packet_information(true);
         });
 
         #[cfg(target_os = "windows")]
         let verified_wintun = {
-            configuration.tun_name("sshportal");
+            configuration.tun_name("bifrost");
             let bundled_wintun = wintun_path()?;
             let verified_wintun = VerifiedWintun::prepare(&bundled_wintun)
                 .context("failed to stage and verify the bundled Wintun DLL")?;
@@ -199,14 +199,14 @@ fn validate_platform_contract(_device: &tun::AsyncDevice) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn wintun_path() -> Result<PathBuf> {
-    let executable = std::env::current_exe().context("failed to locate sshportal-server.exe")?;
+    let executable = std::env::current_exe().context("failed to locate bifrost.exe")?;
     let directory = executable
         .parent()
-        .context("sshportal-server.exe has no parent directory")?;
+        .context("bifrost.exe has no parent directory")?;
     let path = directory.join("wintun.dll");
     if !path.is_file() {
         return Err(anyhow!(
-            "{} is missing; place the signed Wintun DLL beside sshportal-server.exe",
+            "{} is missing; place the signed Wintun DLL beside bifrost.exe",
             path.display()
         ));
     }

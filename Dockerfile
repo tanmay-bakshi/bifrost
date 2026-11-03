@@ -17,8 +17,7 @@ RUN set -eux; \
             *) echo "unsupported Docker target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
         esac; \
     fi; \
-    install -m 0755 "/prebuilt-target/${resolved_target}/release/sshportal-server" /usr/local/bin/sshportal-server; \
-    install -m 0755 "/prebuilt-target/${resolved_target}/release/sshportal-client" /usr/local/bin/sshportal-client; \
+    install -m 0755 "/prebuilt-target/${resolved_target}/release/bifrost" /usr/local/bin/bifrost; \
     rm -rf /prebuilt-target
 
 ENV HOME=/root

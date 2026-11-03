@@ -16,19 +16,21 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::Capability;
 use crate::NETWORK_SESSION_FLOW_LIMIT;
-use crate::OfferedSession;
 use crate::debug::debug_log;
-use crate::network::client_resolver::ClientResolver;
+use crate::network::backend::NetworkBackend;
 use crate::network::egress::{ConnectedUdpSocket, TCP_DIAL_BUDGET, connect_udp, dial_tcp};
-use crate::network::policy::ClientNetworkPolicy;
+use crate::network::policy::ProviderNetworkPolicy;
 use crate::network::protocol::{
     NetworkError, NetworkErrorKind, NetworkTarget, UdpCapsule, UdpCapsuleDecoder,
     decode_udp_peer_header, encode_udp_capsule, write_udp_peer_header,
 };
+use crate::network::relay::forward_network_request;
 use crate::network::resolver_session::{
-    MAX_CONCURRENT_RESOLVER_REQUESTS, handle_client_resolver_request, is_resolver_request,
+    MAX_CONCURRENT_RESOLVER_REQUESTS, handle_resolver_request, is_resolver_request,
 };
+use crate::shutdown::combine_results;
 use crate::websocket::websocket_to_io;
 
 const CAPSULE_PROTOCOL_HEADER: &str = "capsule-protocol";
@@ -53,7 +55,7 @@ const NETWORK_SESSION_STREAM_LIMIT: usize =
     NETWORK_SESSION_FLOW_LIMIT + MAX_CONCURRENT_RESOLVER_REQUESTS;
 
 #[derive(Clone)]
-pub(crate) struct OperatorNetworkSession {
+pub(crate) struct ConsumerNetworkSession {
     requests: h2::client::SendRequest<Bytes>,
     flow_permits: Arc<Semaphore>,
     pub(super) resolver_permits: Arc<Semaphore>,
@@ -102,7 +104,7 @@ pub(crate) struct UdpTunnel {
     peer: SocketAddr,
 }
 
-impl OperatorNetworkSession {
+impl ConsumerNetworkSession {
     #[cfg(test)]
     pub(super) fn from_test_transport(
         requests: h2::client::SendRequest<Bytes>,
@@ -123,6 +125,14 @@ impl OperatorNetworkSession {
             .expect("the test network flow permit must be available")
     }
 
+    pub(super) fn acquire_flow_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, NetworkError> {
+        Arc::clone(&self.flow_permits)
+            .try_acquire_owned()
+            .map_err(|_| NetworkError::resource_limit("network session flow limit reached"))
+    }
+
     pub(crate) async fn connect_tcp(
         &self,
         target: NetworkTarget,
@@ -130,9 +140,7 @@ impl OperatorNetworkSession {
         target
             .validate()
             .map_err(|error| NetworkError::new(NetworkErrorKind::Protocol, error.to_string()))?;
-        let permit = Arc::clone(&self.flow_permits)
-            .try_acquire_owned()
-            .map_err(|_| NetworkError::resource_limit("network session flow limit reached"))?;
+        let permit = self.acquire_flow_permit()?;
         let mut request = Request::builder()
             .method(Method::CONNECT)
             .version(Version::HTTP_2)
@@ -190,9 +198,7 @@ impl OperatorNetworkSession {
         target
             .validate()
             .map_err(|error| NetworkError::new(NetworkErrorKind::Protocol, error.to_string()))?;
-        let permit = Arc::clone(&self.flow_permits)
-            .try_acquire_owned()
-            .map_err(|_| NetworkError::resource_limit("network session flow limit reached"))?;
+        let permit = self.acquire_flow_permit()?;
         let mut request = Request::builder()
             .method(Method::CONNECT)
             .version(Version::HTTP_2)
@@ -281,7 +287,7 @@ impl OperatorNetworkSession {
         if extended_connect && !requests.is_extended_connect_protocol_enabled() {
             return Err(NetworkError::new(
                 NetworkErrorKind::Protocol,
-                "client did not enable HTTP/2 Extended CONNECT",
+                "provider did not enable HTTP/2 Extended CONNECT",
             ));
         }
         requests
@@ -290,7 +296,7 @@ impl OperatorNetworkSession {
     }
 }
 
-fn tcp_open_timeout_error() -> NetworkError {
+pub(super) fn tcp_open_timeout_error() -> NetworkError {
     NetworkError::new(
         NetworkErrorKind::TimedOut,
         "timed out waiting for the client to open the TCP destination",
@@ -305,7 +311,7 @@ fn udp_open_timeout_error() -> NetworkError {
 }
 
 impl NetworkSessionRuntime {
-    pub(crate) async fn wait(mut self) -> Result<()> {
+    pub(crate) async fn wait(&mut self) -> Result<()> {
         enum CompletedTask {
             Connection(Result<Result<()>, tokio::task::JoinError>),
             Keepalive(Result<Result<()>, tokio::task::JoinError>),
@@ -333,6 +339,26 @@ impl NetworkSessionRuntime {
                 result
                     .context("HTTP/2 network keepalive task failed to join")
                     .and_then(|result| result)
+            }
+        }
+    }
+    pub(crate) fn stop_keepalive(&mut self) {
+        if let Some(task) = &self.keepalive_task {
+            task.abort();
+        }
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        abort_network_task(self.keepalive_task.take()).await;
+        let Some(mut connection) = self.connection_task.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(Duration::from_secs(10), &mut connection).await {
+            Ok(result) => result.context("network connection task failed to join")?,
+            Err(_) => {
+                connection.abort();
+                let _ = connection.await;
+                bail!("network connection did not finish orderly shutdown");
             }
         }
     }
@@ -775,24 +801,25 @@ impl UdpReceiveCredit {
     }
 }
 
-pub(crate) async fn start_operator_network_session<S>(
+pub(crate) async fn start_consumer_network_session<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
-) -> Result<(OperatorNetworkSession, NetworkSessionRuntime)>
+) -> Result<(ConsumerNetworkSession, NetworkSessionRuntime)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    start_operator_network_session_with_timeout(websocket, NETWORK_HANDSHAKE_TIMEOUT).await
+    start_consumer_network_session_with_timeout(websocket, NETWORK_HANDSHAKE_TIMEOUT).await
 }
 
-async fn start_operator_network_session_with_timeout<S>(
+async fn start_consumer_network_session_with_timeout<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
     handshake_timeout: Duration,
-) -> Result<(OperatorNetworkSession, NetworkSessionRuntime)>
+) -> Result<(ConsumerNetworkSession, NetworkSessionRuntime)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let handshake_deadline = Instant::now() + handshake_timeout;
     let io = websocket_to_io(websocket);
+    let completion = io.completion();
     let mut builder = h2::client::Builder::new();
     configure_client_builder(&mut builder);
     let (requests, mut connection) =
@@ -804,9 +831,14 @@ where
         .ping_pong()
         .context("HTTP/2 network session does not support keepalive pings")?;
     let connection_task = tokio::spawn(async move {
-        connection
+        let result = connection
             .await
-            .context("HTTP/2 network session closed unexpectedly")
+            .context("HTTP/2 network session closed unexpectedly");
+        let cleanup = completion
+            .wait()
+            .await
+            .context("WebSocket transport cleanup failed");
+        combine_results(result, cleanup, "WebSocket transport cleanup also failed")
     });
     let settings_synchronization: Result<()> = async {
         tokio::time::timeout_at(handshake_deadline, ping_pong.ping(h2::Ping::opaque()))
@@ -823,7 +855,7 @@ where
     }
     let keepalive_task = tokio::spawn(run_keepalive(ping_pong));
     Ok((
-        OperatorNetworkSession {
+        ConsumerNetworkSession {
             requests,
             flow_permits: Arc::new(Semaphore::new(NETWORK_SESSION_FLOW_LIMIT)),
             resolver_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RESOLVER_REQUESTS)),
@@ -835,37 +867,44 @@ where
     ))
 }
 
-pub async fn run_client_network_session<S>(
+#[cfg(test)]
+pub async fn run_provider_network_session<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
-    approved_session: OfferedSession,
+    approved_session: Capability,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    run_client_network_session_with_timeout(websocket, approved_session, NETWORK_HANDSHAKE_TIMEOUT)
-        .await
+    run_provider_network_session_with_backend(
+        websocket,
+        approved_session,
+        NetworkBackend::local(),
+        NETWORK_HANDSHAKE_TIMEOUT,
+        CancellationToken::new(),
+    )
+    .await
 }
 
-async fn run_client_network_session_with_timeout<S>(
+pub(crate) async fn run_provider_network_session_with_backend<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
-    approved_session: OfferedSession,
+    approved_session: Capability,
+    backend: Arc<NetworkBackend>,
     handshake_timeout: Duration,
+    shutdown: CancellationToken,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let policy = Arc::new(ClientNetworkPolicy::from_approved_session(
-        &approved_session,
-    )?);
+    let policy = Arc::new(ProviderNetworkPolicy::from_capability(&approved_session)?);
     let handshake_deadline = Instant::now() + handshake_timeout;
     let io = websocket_to_io(websocket);
+    let completion = io.completion();
     let mut builder = h2::server::Builder::new();
     configure_server_builder(&mut builder);
-    let mut connection =
-        tokio::time::timeout_at(handshake_deadline, builder.handshake::<_, Bytes>(io))
-            .await
-            .context("timed out establishing the HTTP/2 network session")?
-            .context("failed to establish the HTTP/2 network session")?;
+    let mut connection = tokio::select! {
+        _ = shutdown.cancelled() => return Ok(()),
+        result = tokio::time::timeout_at(handshake_deadline, builder.handshake::<_, Bytes>(io)) => result.context("timed out establishing the HTTP/2 network session")??,
+    };
     let ping_pong = connection
         .ping_pong()
         .context("HTTP/2 network session does not support keepalive pings")?;
@@ -873,21 +912,25 @@ where
     tokio::pin!(keepalive);
     let flow_permits = Arc::new(Semaphore::new(NETWORK_SESSION_FLOW_LIMIT));
     let resolver_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_RESOLVER_REQUESTS));
-    let resolver = Arc::new(ClientResolver::from_system_configuration());
+    let resolver = backend;
     let mut flows = JoinSet::new();
 
+    let mut connection_ended = false;
     let session_result = loop {
-        if let Err(error) = reap_completed_client_flows(&mut flows) {
+        if let Err(error) = reap_completed_provider_flows(&mut flows) {
             break Err(error);
         }
         tokio::select! {
+            _ = shutdown.cancelled() => break Ok(()),
             request = connection.accept() => {
                 let Some(request) = request else {
+                    connection_ended = true;
                     break Ok(());
                 };
                 let (request, respond) = match request {
                     Ok(request) => request,
                     Err(error) => {
+                        connection_ended = true;
                         break Err(error).context("failed to accept HTTP/2 network stream");
                     }
                 };
@@ -905,7 +948,7 @@ where
                         } else {
                             reject_request(
                                 respond,
-                                NetworkError::resource_limit("client network flow limit reached"),
+                                NetworkError::resource_limit("provider network flow limit reached"),
                             )
                         };
                         if let Err(error) = rejection {
@@ -918,7 +961,7 @@ where
                 let policy = Arc::clone(&policy);
                 flows.spawn(async move {
                     let _permit = permit;
-                    handle_client_request(request, respond, resolver, policy).await
+                    handle_network_request(request, respond, resolver, policy).await
                 });
             }
             result = &mut keepalive => {
@@ -926,7 +969,7 @@ where
             }
             result = flows.join_next(), if !flows.is_empty() => {
                 if let Some(result) = result
-                    && let Err(error) = handle_client_flow_completion(result)
+                    && let Err(error) = handle_provider_flow_completion(result)
                 {
                     break Err(error);
                 }
@@ -936,37 +979,63 @@ where
 
     flows.abort_all();
     while flows.join_next().await.is_some() {}
-    session_result
+    let drain = if connection_ended {
+        Ok(())
+    } else {
+        connection.graceful_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(stream) = connection.accept().await {
+                let (_, mut respond) = stream?;
+                respond.send_reset(Reason::CANCEL);
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("HTTP/2 provider shutdown timed out")
+        .and_then(|result| result)
+    };
+    drop(connection);
+    let cleanup = completion
+        .wait()
+        .await
+        .context("WebSocket transport cleanup failed");
+    combine_results(
+        combine_results(session_result, drain, "HTTP/2 shutdown also failed"),
+        cleanup,
+        "WebSocket cleanup also failed",
+    )
 }
 
-fn reap_completed_client_flows(flows: &mut JoinSet<Result<()>>) -> Result<()> {
+fn reap_completed_provider_flows(flows: &mut JoinSet<Result<()>>) -> Result<()> {
     while let Some(result) = flows.try_join_next() {
-        handle_client_flow_completion(result)?;
+        handle_provider_flow_completion(result)?;
     }
     Ok(())
 }
 
-fn handle_client_flow_completion(result: std::result::Result<Result<()>, JoinError>) -> Result<()> {
+fn handle_provider_flow_completion(
+    result: std::result::Result<Result<()>, JoinError>,
+) -> Result<()> {
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             debug_log(format!(
-                "client network flow ended with an error: {error:#}"
+                "provider network flow ended with an error: {error:#}"
             ));
             Ok(())
         }
-        Err(error) => Err(error).context("client network flow task failed to join"),
+        Err(error) => Err(error).context("provider network flow task failed to join"),
     }
 }
 
-async fn handle_client_request(
+async fn handle_network_request(
     request: Request<RecvStream>,
     respond: h2::server::SendResponse<Bytes>,
-    resolver: Arc<ClientResolver>,
-    policy: Arc<ClientNetworkPolicy>,
+    resolver: Arc<NetworkBackend>,
+    policy: Arc<ProviderNetworkPolicy>,
 ) -> Result<()> {
     if is_resolver_request(&request) {
-        return handle_client_resolver_request(request, respond, resolver, policy).await;
+        return handle_resolver_request(request, respond, resolver, policy).await;
     }
     if request.method() != Method::CONNECT || request.version() != Version::HTTP_2 {
         return reject_request(
@@ -975,9 +1044,9 @@ async fn handle_client_request(
         );
     }
     match request.extensions().get::<h2::ext::Protocol>() {
-        None => run_client_tcp(request, respond, &resolver, &policy).await,
+        None => serve_tcp(request, respond, &resolver, &policy).await,
         Some(protocol) if protocol.as_ref() == b"connect-udp" => {
-            run_client_udp(request, respond, &resolver, &policy).await
+            serve_udp(request, respond, &resolver, &policy).await
         }
         Some(_) => reject_request(
             respond,
@@ -989,11 +1058,11 @@ async fn handle_client_request(
     }
 }
 
-async fn run_client_tcp(
+async fn serve_tcp(
     request: Request<RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
-    resolver: &ClientResolver,
-    policy: &ClientNetworkPolicy,
+    resolver: &NetworkBackend,
+    policy: &ProviderNetworkPolicy,
 ) -> Result<()> {
     let target = match NetworkTarget::from_connect_uri(request.uri(), request.headers()) {
         Ok(target) => target,
@@ -1007,6 +1076,12 @@ async fn run_client_tcp(
     if let Err(error) = policy.authorize_target(&target) {
         return reject_request(respond, error);
     }
+    let resolver = match resolver {
+        NetworkBackend::Local(resolver) => resolver,
+        NetworkBackend::Upstream(upstream) => {
+            return forward_network_request(request, respond, upstream).await;
+        }
+    };
     let socket = tokio::select! {
         biased;
         reset = std::future::poll_fn(|context| respond.poll_reset(context)) => {
@@ -1035,11 +1110,11 @@ async fn run_client_tcp(
     Ok(())
 }
 
-async fn run_client_udp(
+async fn serve_udp(
     request: Request<RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
-    resolver: &ClientResolver,
-    policy: &ClientNetworkPolicy,
+    resolver: &NetworkBackend,
+    policy: &ProviderNetworkPolicy,
 ) -> Result<()> {
     if let Err(error) = validate_capsule_protocol_header(request.headers(), "request") {
         return reject_request(
@@ -1059,6 +1134,12 @@ async fn run_client_udp(
     if let Err(error) = policy.authorize_target(&target) {
         return reject_request(respond, error);
     }
+    let resolver = match resolver {
+        NetworkBackend::Local(resolver) => resolver,
+        NetworkBackend::Upstream(upstream) => {
+            return forward_network_request(request, respond, upstream).await;
+        }
+    };
     let ConnectedUdpSocket { socket, peer } = tokio::select! {
         biased;
         reset = std::future::poll_fn(|context| respond.poll_reset(context)) => {
@@ -1195,7 +1276,7 @@ fn validate_capsule_protocol_header(headers: &HeaderMap, message_kind: &str) -> 
     Ok(())
 }
 
-pub(crate) async fn bridge_operator_tcp<T>(stream: T, tunnel: TcpTunnel) -> Result<()>
+pub(crate) async fn bridge_consumer_tcp<T>(stream: T, tunnel: TcpTunnel) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1413,7 +1494,9 @@ pub(super) async fn send_h2_data(
     Ok(())
 }
 
-fn send_h2_end_stream(send: &mut SendStream<Bytes>) -> std::result::Result<(), h2::Error> {
+pub(super) fn send_h2_end_stream(
+    send: &mut SendStream<Bytes>,
+) -> std::result::Result<(), h2::Error> {
     send.reserve_capacity(0);
     send.send_trailers(HeaderMap::new())
 }
@@ -1427,7 +1510,10 @@ async fn reserve_send_capacity(send: &mut SendStream<Bytes>, requested: usize) -
     Ok(capacity.min(requested))
 }
 
-fn reject_request(mut respond: h2::server::SendResponse<Bytes>, error: NetworkError) -> Result<()> {
+pub(super) fn reject_request(
+    mut respond: h2::server::SendResponse<Bytes>,
+    error: NetworkError,
+) -> Result<()> {
     let mut response = Response::builder()
         .status(error.kind.response_status())
         .version(Version::HTTP_2)
@@ -1538,18 +1624,18 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        MAX_CONCURRENT_RESOLVER_REQUESTS, NetworkSessionRuntime, NetworkTarget,
-        OperatorNetworkSession, bridge_operator_tcp, bridge_tcp_streams, configure_client_builder,
-        configure_server_builder, pump_h2_to_io, pump_io_to_h2, run_client_network_session,
-        run_client_network_session_with_timeout, start_operator_network_session,
-        start_operator_network_session_with_timeout, validate_capsule_protocol_header,
+        ConsumerNetworkSession, MAX_CONCURRENT_RESOLVER_REQUESTS, NetworkSessionRuntime,
+        NetworkTarget, bridge_consumer_tcp, bridge_tcp_streams, configure_client_builder,
+        configure_server_builder, pump_h2_to_io, pump_io_to_h2, run_provider_network_session,
+        run_provider_network_session_with_backend, start_consumer_network_session,
+        start_consumer_network_session_with_timeout, validate_capsule_protocol_header,
     };
-    use crate::control::{OfferedSession, VpnScope};
+    use crate::NetworkPolicy;
+    use crate::control::Capability;
     use crate::network::protocol::{
         NetworkError, NetworkErrorKind, UdpCapsule, encode_udp_capsule, write_udp_peer_header,
     };
     use crate::network::resolver_protocol::ResolveRequest;
-    use crate::vpn::SystemVpnPolicy;
 
     struct ReadErrorStream;
 
@@ -1632,7 +1718,7 @@ mod tests {
 
     #[tokio::test]
     async fn network_runtime_does_not_repoll_its_completed_task() {
-        let runtime = NetworkSessionRuntime {
+        let mut runtime = NetworkSessionRuntime {
             connection_task: Some(tokio::spawn(async { Ok(()) })),
             keepalive_task: Some(tokio::spawn(std::future::pending())),
         };
@@ -1651,15 +1737,19 @@ mod tests {
         let operator_websocket =
             WebSocketStream::from_raw_socket(operator_io, Role::Client, None).await;
         let operator =
-            start_operator_network_session_with_timeout(operator_websocket, TEST_HANDSHAKE_TIMEOUT);
+            start_consumer_network_session_with_timeout(operator_websocket, TEST_HANDSHAKE_TIMEOUT);
 
         let (client_io, _silent_client_peer) = duplex(64 * 1024);
         let client_websocket =
             WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
-        let client = run_client_network_session_with_timeout(
+        let client = run_provider_network_session_with_backend(
             client_websocket,
-            OfferedSession::Socks {},
+            Capability::Network {
+                policy: crate::NetworkPolicy::unrestricted(),
+            },
+            crate::network::backend::NetworkBackend::local(),
             TEST_HANDSHAKE_TIMEOUT,
+            tokio_util::sync::CancellationToken::new(),
         );
 
         let (operator_result, client_result) =
@@ -1674,7 +1764,7 @@ mod tests {
         };
         let client_error = match client_result {
             Err(error) => error,
-            Ok(()) => panic!("client network handshake accepted a silent peer"),
+            Ok(()) => panic!("provider network handshake accepted a silent peer"),
         };
         for error in [operator_error, client_error] {
             assert!(error.to_string().contains("timed out"), "{error:#}");
@@ -1697,7 +1787,7 @@ mod tests {
     }
 
     async fn memory_session() -> (
-        OperatorNetworkSession,
+        ConsumerNetworkSession,
         tokio::task::JoinHandle<anyhow::Result<()>>,
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
@@ -1744,7 +1834,7 @@ mod tests {
             connection.await?;
             Ok(())
         });
-        let session = OperatorNetworkSession {
+        let session = ConsumerNetworkSession {
             requests,
             flow_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(256)),
             resolver_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -1817,7 +1907,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         });
         ping_pong.ping(h2::Ping::opaque()).await.unwrap();
-        let session = OperatorNetworkSession {
+        let session = ConsumerNetworkSession {
             requests,
             flow_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             resolver_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -2085,9 +2175,9 @@ mod tests {
     }
 
     async fn policy_session(
-        approved_session: OfferedSession,
+        approved_session: Capability,
     ) -> (
-        OperatorNetworkSession,
+        ConsumerNetworkSession,
         NetworkSessionRuntime,
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
@@ -2096,11 +2186,11 @@ mod tests {
             WebSocketStream::from_raw_socket(operator_io, Role::Client, None).await;
         let client_websocket =
             WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
-        let client_task = tokio::spawn(run_client_network_session(
+        let client_task = tokio::spawn(run_provider_network_session(
             client_websocket,
             approved_session,
         ));
-        let (session, runtime) = start_operator_network_session(operator_websocket)
+        let (session, runtime) = start_consumer_network_session(operator_websocket)
             .await
             .unwrap();
         (session, runtime, client_task)
@@ -2114,11 +2204,13 @@ mod tests {
                 WebSocketStream::from_raw_socket(operator_io, Role::Server, None).await;
             let client_websocket =
                 WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-            let client_task = tokio::spawn(run_client_network_session(
+            let client_task = tokio::spawn(run_provider_network_session(
                 client_websocket,
-                OfferedSession::Socks {},
+                Capability::Network {
+                    policy: crate::NetworkPolicy::unrestricted(),
+                },
             ));
-            let (session, runtime) = start_operator_network_session(operator_websocket)
+            let (session, mut runtime) = start_consumer_network_session(operator_websocket)
                 .await
                 .unwrap();
             drop(session);
@@ -2138,7 +2230,10 @@ mod tests {
             let (size, peer) = echo_socket.recv_from(&mut buffer).await.unwrap();
             echo_socket.send_to(&buffer[..size], peer).await.unwrap();
         });
-        let (session, runtime, client_task) = policy_session(OfferedSession::Socks {}).await;
+        let (session, runtime, client_task) = policy_session(Capability::Network {
+            policy: crate::NetworkPolicy::unrestricted(),
+        })
+        .await;
 
         let tunnel = session.open_udp(echo_address.into()).await.unwrap();
         assert_eq!(tunnel.peer_addr(), echo_address);
@@ -2174,7 +2269,7 @@ mod tests {
             .await
             .unwrap();
         let (application, proxy) = duplex(32 * 1024);
-        let bridge = tokio::spawn(bridge_operator_tcp(proxy, tunnel));
+        let bridge = tokio::spawn(bridge_consumer_tcp(proxy, tunnel));
         let payload = (0..5 * 1024 * 1024)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
@@ -2205,15 +2300,12 @@ mod tests {
 
     #[tokio::test]
     async fn selective_policy_rejects_unapproved_streams_without_ending_the_session() {
-        let policy = SystemVpnPolicy::new(
+        let policy = NetworkPolicy::new(
             vec!["10.20.0.0/16".parse().unwrap()],
             vec!["allowed.example".to_string()],
         )
         .unwrap();
-        let (session, runtime, client_task) = policy_session(OfferedSession::Vpn {
-            scope: VpnScope::System { policy },
-        })
-        .await;
+        let (session, runtime, client_task) = policy_session(Capability::Network { policy }).await;
 
         let tcp_error = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2261,30 +2353,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_without_domain_routing_reject_resolver_streams() {
+    async fn cidr_only_scope_rejects_resolver_streams() {
         let cidr_only =
-            SystemVpnPolicy::new(vec!["10.20.0.0/16".parse().unwrap()], Vec::new()).unwrap();
-        for approved_session in [
-            OfferedSession::Socks {},
-            OfferedSession::Vpn {
-                scope: VpnScope::System { policy: cidr_only },
-            },
-        ] {
-            let (session, runtime, client_task) = policy_session(approved_session).await;
+            NetworkPolicy::new(vec!["10.20.0.0/16".parse().unwrap()], Vec::new()).unwrap();
+        let (session, runtime, client_task) =
+            policy_session(Capability::Network { policy: cidr_only }).await;
 
-            let error = tokio::time::timeout(
-                Duration::from_secs(2),
-                session.resolve(ResolveRequest::new("blocked.example", 1, 1, 1_000).unwrap()),
-            )
-            .await
-            .expect("resolver stream policy rejection timed out")
-            .unwrap_err();
-            assert_eq!(error.kind, NetworkErrorKind::PermissionDenied);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.resolve(ResolveRequest::new("blocked.example", 1, 1, 1_000).unwrap()),
+        )
+        .await
+        .expect("resolver stream policy rejection timed out")
+        .unwrap_err();
+        assert_eq!(error.kind, NetworkErrorKind::PermissionDenied);
 
-            drop(session);
-            drop(runtime);
-            client_task.abort();
-            let _ = client_task.await;
-        }
+        drop(session);
+        drop(runtime);
+        client_task.abort();
+        let _ = client_task.await;
     }
 }

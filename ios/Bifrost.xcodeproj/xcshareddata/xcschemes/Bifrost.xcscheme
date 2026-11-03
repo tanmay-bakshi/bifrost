@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A0BFE019A32A054FCF70B9CB"
-               BuildableName = "SSHPortal.app"
-               BlueprintName = "SSHPortal"
-               ReferencedContainer = "container:SSHPortal.xcodeproj">
+               BuildableName = "Bifrost.app"
+               BlueprintName = "Bifrost"
+               ReferencedContainer = "container:Bifrost.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -31,9 +31,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A0BFE019A32A054FCF70B9CB"
-            BuildableName = "SSHPortal.app"
-            BlueprintName = "SSHPortal"
-            ReferencedContainer = "container:SSHPortal.xcodeproj">
+            BuildableName = "Bifrost.app"
+            BlueprintName = "Bifrost"
+            ReferencedContainer = "container:Bifrost.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
@@ -42,9 +42,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "870A1089EF64784CF65FA4FB"
-               BuildableName = "SSHPortalTests.xctest"
-               BlueprintName = "SSHPortalTests"
-               ReferencedContainer = "container:SSHPortal.xcodeproj">
+               BuildableName = "BifrostTests.xctest"
+               BlueprintName = "BifrostTests"
+               ReferencedContainer = "container:Bifrost.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -64,9 +64,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A0BFE019A32A054FCF70B9CB"
-            BuildableName = "SSHPortal.app"
-            BlueprintName = "SSHPortal"
-            ReferencedContainer = "container:SSHPortal.xcodeproj">
+            BuildableName = "Bifrost.app"
+            BlueprintName = "Bifrost"
+            ReferencedContainer = "container:Bifrost.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -81,9 +81,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A0BFE019A32A054FCF70B9CB"
-            BuildableName = "SSHPortal.app"
-            BlueprintName = "SSHPortal"
-            ReferencedContainer = "container:SSHPortal.xcodeproj">
+            BuildableName = "Bifrost.app"
+            BlueprintName = "Bifrost"
+            ReferencedContainer = "container:Bifrost.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct SSHPortalApp: App {
+struct BifrostApp: App {
     @StateObject private var session = SessionModel()
     @Environment(\.scenePhase) private var scenePhase
 
